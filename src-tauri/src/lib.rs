@@ -14,10 +14,9 @@ static PAGE_STATS: Mutex<String> = Mutex::new(String::new());
 /// вводится повторно в обработчике `PageLoad`, когда новый документ уже создан.
 static INJECTION: Mutex<Option<InjectionConfig>> = Mutex::new(None);
 
-/// Признак, что контент-скрипт уже введён в документ текущей навигации.
-/// Нужен, чтобы страховочный таймер не вставлял скрипт второй раз
-/// (двойной перехват fetch/XHR удваивал бы счётчик блокировок).
-static INJECTED: Mutex<bool> = Mutex::new(false);
+/// Номер текущей навигации. Растёт при каждом `navigate_tab`, чтобы фоновые
+/// задачи прошлых переходов не вводили устаревшие настройки в новый документ.
+static NAV_GENERATION: Mutex<u64> = Mutex::new(0);
 
 #[derive(Clone)]
 struct InjectionConfig {
@@ -103,7 +102,15 @@ fn build_content_script(cfg: &InjectionConfig) -> String {
         cfg.cosmetic_blocked,
         cfg.rules_json,
     );
-    format!("{}{}", prefix, include_str!("../../public/content-script.js"))
+    // Guard делает инъекцию идемпотентной: повторный eval в том же документе
+    // ничего не делает, а после навигации window новый и скрипт вводится снова.
+    // Благодаря этому не нужен on_page_load (в tauri 2.12 его нет ни у Webview,
+    // ни у WebviewWindow) — достаточно периодических попыток eval.
+    format!(
+        "if (!window.__difriInjected) {{ window.__difriInjected = true;\n{}\n{}\n}}",
+        prefix,
+        include_str!("../../public/content-script.js")
+    )
 }
 
 /// Забирает снимок статистики блокировок из sessionStorage страницы.
@@ -615,13 +622,17 @@ fn navigate_tab(
         cosmetic_blocked: cosmetic_blocked.unwrap_or(false),
     };
 
-    // Запоминаем настройки: их применит обработчик PageLoad к новому документу.
+    // Запоминаем настройки последнего перехода (используются для снимка статистики).
     if let Ok(mut guard) = INJECTION.lock() {
         *guard = Some(cfg.clone());
     }
-    if let Ok(mut done) = INJECTED.lock() {
-        *done = false;
-    }
+    // Новое поколение навигации: фоновые задачи предыдущего перехода
+    // больше не должны вводить свои настройки в новый документ.
+    let generation = {
+        let mut g = NAV_GENERATION.lock().map_err(|_| "navigation lock poisoned".to_string())?;
+        *g += 1;
+        *g
+    };
 
     let target = normalize_url(&url)?;
 
@@ -649,22 +660,26 @@ fn navigate_tab(
         return Ok(());
     }
 
-    // Страховка: контент-скрипт вводится и по PageLoad, и здесь с задержкой —
-    // если PageLoad::Finished не придёт (страница с ошибкой, кэш, медленный CPU),
-    // приватность всё равно включится.
+    // Инъекция контент-скрипта.
+    //
+    // В tauri 2.12 нет ни `Webview::on_page_load`, ни `WebviewWindow::on_page_load`
+    // (проект собирается с feature `unstable`, где webview и window разделены),
+    // поэтому вместо хука загрузки — серия идемпотентных попыток `eval`.
+    // Guard `window.__difriInjected` внутри скрипта делает повторные вызовы
+    // безопасными: пока документ не заменён навигацией, скрипт вводится один раз,
+    // а в новом документе window пустой и инъекция повторяется.
     if !is_app_page {
         let wv = webview.clone();
         let cfg2 = cfg.clone();
         tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-            let already = INJECTED.lock().map(|g| *g).unwrap_or(false);
-            if already {
-                return;
-            }
-            if wv.eval(&build_content_script(&cfg2)).is_ok() {
-                if let Ok(mut done) = INJECTED.lock() {
-                    *done = true;
+            for delay_ms in [200u64, 500, 900, 1500, 2500] {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let current = NAV_GENERATION.lock().map(|g| *g).unwrap_or_default();
+                if current != generation {
+                    return; // пользователь уже ушёл на другую страницу
                 }
+                let _ = wv.eval(&build_content_script(&cfg2));
+                // Снимок статистики заберёт отчёт о приватности по запросу.
             }
         });
     }
@@ -713,37 +728,9 @@ pub fn run() {
             get_downloads,
             update_filter_list
         ])
-        .setup(|app| {
-            // Инъекция контент-скрипта в каждый загруженный документ.
-            // `PageLoadEvent::Finished` наступает, когда WebView2 уже создал документ,
-            // поэтому `eval` попадает в актуальный контекст, а не в предыдущий.
-            // on_page_load объявлен на Webview, не на WebviewWindow —
-            // поэтому берём именно вебвью, иначе CI роняет сборку.
-            if let Some(webview) = app.get_webview("main") {
-                webview.on_page_load(move |webview, payload| {
-                    match payload.event() {
-                        tauri::webview::PageLoadEvent::Finished => {}
-                        _ => return,
-                    }
-                    // На внутренних страницах контент-скрипт не нужен:
-                    // он рисует панель поверх интерфейса самого браузера.
-                    let url = payload.url().to_string();
-                    if url.contains("app.html")
-                        || url.contains("index.html")
-                        || url.contains("blocked.html")
-                    {
-                        return;
-                    }
-                    let cfg = INJECTION.lock().ok().and_then(|g| g.clone());
-                    if let Some(cfg) = cfg {
-                        if webview.eval(&build_content_script(&cfg)).is_ok() {
-                            if let Ok(mut done) = INJECTED.lock() {
-                                *done = true;
-                            }
-                        }
-                    }
-                });
-            }
+        .setup(|_app| {
+            // Инъекция контент-скрипта выполняется в navigate_tab:
+            // API on_page_load в tauri 2.12 (feature `unstable`) отсутствует.
             Ok(())
         })
         .run(generate_context!())

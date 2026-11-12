@@ -1,0 +1,25 @@
+# Node
+node_modules/
+dist/
+*.local
+.env
+.env.local
+.vite/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+src-tauri/gen-android/
+*.sw.swift
+
+# Rust
+/target/
+**/*.rs.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/

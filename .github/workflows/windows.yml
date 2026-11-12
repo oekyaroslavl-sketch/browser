@@ -1,0 +1,65 @@
+name: Build DiFri Privacy (Windows)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install npm dependencies
+        # `npm ci` требует синхронизированного package-lock.json.
+        # Если lock устарел — откатываемся на `npm install`, чтобы сборка не падала.
+        run: npm ci || npm install
+
+      - name: Build frontend
+        run: npx vite build
+
+      - name: Build with Tauri
+        run: npm run tauri:build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Collect Windows installers
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Get-ChildItem src-tauri/target/release/bundle -Recurse -File |
+            Where-Object { $_.Extension -in @('.msi', '.exe') } |
+            ForEach-Object { Copy-Item $_.FullName -Destination ./out/ -Force }
+          Get-ChildItem out | Format-Table Name, Length
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: difri-privacy-windows
+          path: |
+            out/*.msi
+            out/*.exe
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,27 @@
+{
+  "name": "difri-privacy",
+  "private": true,
+  "version": "2.1.0",
+  "description": "DiFri Privacy — Lightweight cross-platform private browser (Windows + Android) forked from DiFri",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 5173",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "tauri:android:init": "tauri android init",
+    "tauri:android:build": "tauri android build --apk"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.2.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.2.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
+  }
+}

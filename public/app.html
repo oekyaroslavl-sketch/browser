@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DiFri Privacy — Браузер</title>
+  <link rel="icon" href="/svg/shield.svg" type="image/svg+xml" />
+  <style>
+    :root {
+      --bg: #0f0f0f;
+      --panel: #161616;
+      --toolbar: #1a1a1a;
+      --text: #eaeaea;
+      --muted: #949494;
+      --accent: #bd93f9;
+      --border: #2c2c2c;
+      --danger: #ff5555;
+      --ok: #50fa7b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #app { height: 100%; overflow: hidden; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    #app { display: flex; flex-direction: column; height: 100%; }
+
+    /* Toolbar ( fixed сверху, z-index выше дочерних вебвью ) */
+    .toolbar {
+      background: var(--toolbar);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: stretch;
+      height: 52px;
+      flex-shrink: 0;
+      z-index: 1000;
+      position: fixed;
+      top: 0; left: 0; right: 0;
+    }
+    .btn {
+      all: unset;
+      display: grid;
+      place-items: center;
+      width: 44px;
+      height: 44px;
+      color: var(--muted);
+      cursor: pointer;
+      border-radius: 8px;
+      margin: 4px;
+    }
+    .btn:hover { background: #262626; color: var(--text); }
+    .btn svg { width: 20px; height: 20px; fill: var(--muted); stroke: var(--muted); }
+    .btn.danger:hover { color: var(--danger); background: rgba(255,85,85,0.1); }
+    .btn.danger:hover svg { fill: var(--danger); stroke: var(--danger); }
+
+    .brand {
+      display: grid;
+      place-items: center;
+      width: 44px;
+      margin: 4px 4px 4px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+    .brand svg { width: 22px; height: 22px; filter: drop-shadow(0 0 6px rgba(189,147,249,0.35)); }
+
+    .urlbar {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      margin: 6px 8px;
+    }
+    #url {
+      flex: 1;
+      height: 36px;
+      padding: 0 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #0f0f0f;
+      color: var(--text);
+      font-size: 14px;
+      outline: none;
+    }
+    #url:focus { border-color: var(--accent); box-shadow: 0 0 0 4px rgba(189,147,249,0.12); }
+    #url::placeholder { color: #666; }
+    .lock {
+      width: 36px; height: 36px; display: grid; place-items: center;
+      color: var(--ok); margin-right: 6px;
+    }
+    .lock svg { width: 16px; height: 16px; fill: none; stroke: var(--ok); stroke-width: 1.8; }
+
+    /* Tab strip — под тулбаром */
+    .tabstrip {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      overflow-x: auto;
+      flex-shrink: 0;
+      height: 40px;
+      position: fixed;
+      top: 52px; left: 0; right: 0;
+      z-index: 999;
+    }
+    .tab {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 10px;
+      background: #1f1f1f;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 13px;
+      cursor: pointer;
+      white-space: nowrap;
+      min-width: 150px;
+    }
+    .tab:hover { border-color: #444; }
+    .tab.active { background: var(--toolbar); border-color: var(--accent); }
+    .tab.active .title { color: var(--accent); }
+    .tab .close {
+      all: unset;
+      width: 18px; height: 18px;
+      border-radius: 4px;
+      display: grid; place-items: center;
+      color: var(--muted); cursor: pointer;
+      flex-shrink: 0;
+    }
+    .tab .close:hover { background: var(--danger); color: #fff; }
+    .tab .close svg { width: 12px; height: 12px; fill: var(--muted); stroke: var(--muted); }
+    .tab .close:hover svg { fill: #fff; stroke: #fff; }
+
+    /* Контентная область — здесь отображаются дочерние вебвью (нативные) */
+    #stage {
+      flex: 1;
+      position: relative;
+      background: #0a0a0a;
+      margin-top: 92px; /* toolbar 52 + tabstrip 40 */
+      overflow: hidden;
+    }
+
+    /* Статус тулбар */
+    #toast {
+      position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+      background: #1a1a1a; border: 1px solid var(--border);
+      padding: 10px 16px; border-radius: 10px; color: var(--muted);
+      font-size: 13px; pointer-events: none; opacity: 0; transition: opacity .25s;
+      z-index: 2000;
+    }
+    #toast.show { opacity: 1; }
+    #toast b { color: var(--text); }
+
+    @media (max-width: 560px) {
+      .toolbar { height: 48px; }
+      .tabstrip { top: 48px; height: 36px; }
+      #stage { margin-top: 84px; }
+      .btn { width: 40px; height: 40px; margin: 3px; }
+      .brand { width: 40px; margin: 3px 3px 3px 8px; }
+      #url { height: 32px; font-size: 13px; }
+      .tabstrip { height: 36px; padding: 3px 8px; gap: 4px; }
+      .tab { min-width: 120px; padding: 3px 8px; font-size: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="toolbar">
+      <div class="brand">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+          <path d="M12 2L4 5.4V11.2C4 16.55 7.41 21.54 12 22.8C16.59 21.54 20 16.55 20 11.2V5.4L12 2Z" stroke="#bd93f9" stroke-width="2" stroke-linejoin="round" fill="rgba(189,147,249,0.16)"/>
+          <path d="M9 12.2L11.1 14.3L15.4 10" stroke="#50fa7b" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+
+      <button class="btn" id="btnBack" title="Назад">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+      </button>
+      <button class="btn" id="btnForward" title="Вперёд">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+      </button>
+      <button class="btn" id="btnReload" title="Перезагрузить">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4v6h6"/><path d="M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/></svg>
+      </button>
+
+      <button class="btn" id="btnDownloads" title="Менеджер загрузок">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      </button>
+
+      <div class="urlbar">
+        <div class="lock" id="lock" aria-hidden="true">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><rect x="5" y="11" width="14" height="10" rx="2.5"/><path d="M8 11V7.5C8 5.29 9.79 3.5 12 3.5"/><path d="M16 11V7.5C16 5.29 14.21 3.5 12 3.5"/></svg>
+        </div>
+        <input type="text" id="url" placeholder="Адрес или поисковый запрос" autocomplete="off" spellcheck="false" />
+      </div>
+
+      <button class="btn" id="btnNewTab" title="Новая вкладка">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      </button>
+
+      <button class="btn danger" id="btnBurn" title="Сжечь сессию (очистить куки, кэш, локальное хранилище)">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22C16.4 22 19.5 18.9 19.5 14.5C19.5 10.2 16.4 6.1 12.6 2.5C10.1 5.3 8.8 7.8 8.7 10.2C7.4 9.4 6.9 8 6.9 8C5.3 9.9 4.5 12.1 4.5 14.5C4.5 18.9 7.6 22 12 22Z"/><path d="M12.5 2C12.5 2 16.5 5.6 16.5 9.8C16.5 11.1 15.9 12.2 15 12.9C15.4 11.7 15.1 10.3 14.2 9.4C14.2 9.4 14.3 12.2 12.2 13.5C10.9 14.3 10.2 15.6 10.5 17.1C8.3 16.3 7 14.1 7 11.7C7 8.4 9.5 5.4 12.5 2Z"/></svg>
+      </button>
+
+      <button class="btn" id="btnMenu" title="Меню">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+    </div>
+
+    <div class="tabstrip" id="tabstrip">
+      <!-- Вкладки добавляются динамически через JS -->
+    </div>
+
+    <div id="stage">
+      <!-- Дочерние вебвью отображаются здесь (нативные, через Tauri add_child) -->
+    </div>
+    <div id="downloads-panel" style="display:none;position:fixed;top:92px;right:12px;width:340px;background:#161616;border:1px solid var(--border);border-radius:12px;z-index:2000;box-shadow:0 12px 40px rgba(0,0,0,0.6);flex-direction:column;max-height:500px;">
+      <div style="padding:12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+        <div style="font-weight:600;color:#eaeaea;">Загрузки</div>
+        <button onclick="toggleDownloads()" style="all:unset;background:#262626;border:1px solid #444;color:#eaeaea;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:12px;">✕</button>
+      </div>
+      <div id="downloads-list" style="padding:8px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;">
+        <!-- Загрузки добавляются динамически -->
+        <div style="padding:12px;color:#a0a0a0;text-align:center;font-size:13px;">Нет активных загрузок</div>
+      </div>
+      <div style="padding:8px;border-top:1px solid var(--border);text-align:center;">
+        <button onclick="promptDownload()" style="all:unset;background:#262626;border:1px solid var(--border);color:#eaeaea;padding:8px 16px;border-radius:8px;cursor:pointer;font-size:13px;width:100%;">+ Скачать по URL</button>
+      </div>
+    </div>
+
+    <div id="toast"></div>
+  </div>
+
+  <script type="module">
+    import { invoke } from "@tauri-apps/api/core";
+
+    const APP_ORIGIN = window.location.origin;
+
+    const state = {
+      shield: localStorage.getItem("difri:shield") !== "false",
+      cleaner: localStorage.getItem("difri:cleaner") !== "false",
+      doh: localStorage.getItem("difri:doh:enabled") === "1",
+      dohProvider: localStorage.getItem("difri:doh:provider") || "cloudflare",
+      permissionsDenied: localStorage.getItem("difri:permissions:denied") === "1",
+      blockThirdPartyCookies: localStorage.getItem("difri:cookies:thirdparty") === "1",
+      httpsOnly: localStorage.getItem("difri:https:only") === "1",
+      tabs: [],           // { label, url }
+      activeId: null,
+      blockedCount: Number(localStorage.getItem("difri:blockedCount") || "0"),
+    };
+
+    const els = {
+      url: document.getElementById("url"),
+      strip: document.getElementById("tabstrip"),
+      stage: document.getElementById("stage"),
+      toast: document.getElementById("toast"),
+      lock: document.getElementById("lock"),
+    };
+
+    function toast(msg, kind = "muted") {
+      els.toast.textContent = msg;
+      els.toast.style.color = kind === "ok" ? "var(--ok)" : kind === "danger" ? "var(--danger)" : "var(--muted)";
+      els.toast.classList.add("show");
+      setTimeout(() => els.toast.classList.remove("show"), 2200);
+    }
+
+    function stripTracking(url) {
+      if (!state.cleaner) return url;
+      try {
+        const u = new URL(url);
+        for (const p of new Set([
+          "utm_source","utm_medium","utm_campaign","utm_term","utm_content","utm_id","utm_name",
+          "fbclid","gclid","dclid","gbraid","wbraid","yclid","ysclid","msclkid","twclid","ttclid",
+          "li_fat_id","mc_cid","mc_eid","_hsenc","_hsmi","igshid","vero_id","mkt_tok",
+          "oly_enc_id","oly_anon_id","rb_clickid","s_kwcid"
+        ])) u.searchParams.delete(p);
+        return u.toString();
+      } catch { return url; }
+    }
+
+    function syncUrlBar(url) {
+      els.url.value = url;
+      try { els.lock.style.color = new URL(url).protocol === "https:" ? "var(--ok)" : "var(--danger)"; }
+      catch { els.lock.style.color = "var(--muted)"; }
+    }
+
+    function renderTabs() {
+      els.strip.innerHTML = state.tabs.map(tab => `
+        <div class="tab ${tab.label === state.activeId ? "active" : ""}" id="tab-${tab.label}" data-label="${tab.label}">
+          <span class="title">${escapeHtml(new URL(tab.url).hostname || tab.label)}</span>
+          <button class="close" data-label="${tab.label}" title="Закрыть вкладку">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+      `).join("");
+      els.strip.querySelectorAll(".tab .close").forEach(btn => {
+        btn.addEventListener("click", (e) => { e.stopPropagation(); closeTab(btn.dataset.label); });
+      });
+      els.strip.querySelectorAll(".tab:not(.close)").forEach(el => {
+        el.addEventListener("click", () => focusTab(el.dataset.label));
+      });
+    }
+
+    function escapeHtml(t) {
+      return String(t).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
+    }
+
+    async function loadTabs() {
+      try {
+        state.tabs = JSON.parse(localStorage.getItem("difri:tabs") || "[]");
+        if (!Array.isArray(state.tabs)) state.tabs = [];
+        state.tabs = state.tabs.filter(t => t && t.label && typeof t.url === "string");
+        if (!state.activeId || !state.tabs.find(t => t.label === state.activeId)) {
+          state.activeId = state.tabs.length ? state.tabs[state.tabs.length - 1].label : null;
+        }
+        renderTabs();
+        syncUrlBar(state.tabs.find(t => t.label === state.activeId)?.url || "");
+      } catch (e) {
+        console.error("loadTabs error:", e);
+      }
+    }
+
+    function saveTabs() {
+      localStorage.setItem("difri:tabs", JSON.stringify(state.tabs));
+      localStorage.setItem("difri:activeTab", state.activeId || "");
+    }
+
+    async function createTab(label, url) {
+      try {
+        state.tabs.push({ label, url: url || "" });
+        if (state.tabs.length > 20) state.tabs.shift();
+        state.activeId = label;
+        saveTabs();
+        renderTabs();
+        syncUrlBar(url || "");
+        if (url) await navigateInTab(url);
+      } catch (e) {
+        toast("РќРµ СѓРґР°Р»РѕСЃСЊ СЃРѕР·РґР°С‚СЊ РІРєР»Р°РґРєСѓ: " + e, "danger");
+      }
+    }
+
+    async function focusTab(label) {
+      const tab = state.tabs.find(t => t.label === label);
+      if (!tab) return;
+      state.activeId = label;
+      saveTabs();
+      syncUrlBar(tab.url);
+      renderTabs();
+      if (tab.url) await navigateInTab(tab.url);
+    }
+
+    async function closeTab(label) {
+      state.tabs = state.tabs.filter(t => t.label !== label);
+      if (state.activeId === label) {
+        state.activeId = state.tabs.length ? state.tabs[state.tabs.length - 1].label : null;
+        const cur = state.tabs.find(t => t.label === state.activeId);
+        syncUrlBar(cur ? cur.url : "");
+      }
+      saveTabs();
+      renderTabs();
+    }
+    async function navigateInTab(raw) {
+      let target = raw.trim();
+      if (!target) return;
+      if (target.includes(".") && !target.includes(" ") && !target.includes("://")) {
+        target = "https://" + target;
+      } else if (!target.includes("://")) {
+        target = "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(target);
+      }
+      target = stripTracking(target);
+
+      const tab = state.tabs.find(t => t.label === state.activeId);
+      if (!tab) return;
+
+      try {
+        await invoke("navigate_tab", {
+          label: tab.label,
+          url: target,
+          app_origin: APP_ORIGIN,
+          doh_enabled: state.doh,
+          doh_provider: state.dohProvider,
+          permissions_denied: state.permissionsDenied,
+          block_third_party_cookies: state.blockThirdPartyCookies,
+          https_only: state.httpsOnly,
+          rules_json: state.filterRulesJson,
+          cosmetic_blocked: state.cosmeticBlocked,
+        });
+        tab.url = target;
+        saveTabs();
+        syncUrlBar(target);
+        renderTabs();
+        toast("Переход: " + new URL(target).hostname);
+      } catch (e) {
+        console.error("navigate_tab error:", e);
+        toast("Ошибка навигации: " + e, "danger");
+      }
+    }
+
+    // === События ===
+
+    // URL bar
+    els.url.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      navigateInTab(els.url.value);
+    });
+
+    document.getElementById("query")?.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      const v = document.getElementById("query").value.trim();
+      if (!v) return;
+      navigateInTab(v);
+    });
+
+    // Navigation buttons
+    document.getElementById("btnBack").addEventListener("click", async () => {
+      const idx = state.tabs.findIndex(t => t.label === state.activeId);
+      if (idx > 0) {
+        await focusTab(state.tabs[idx - 1].label);
+      } else {
+        toast("РќР°Р·Р°Рґ вЂ” РёСЃРїРѕР»СЊР·СѓР№С‚Рµ РєРЅРѕРїРєСѓ РІ РєРѕРЅС‚РµРЅС‚РЅРѕР№ РІРєР»Р°РґРєРµ", "muted");
+      }
+    });
+    document.getElementById("btnForward").addEventListener("click", () => {
+      toast("Вперёд — используйте кнопку в контентной вкладке", "muted");
+    });
+    document.getElementById("btnReload").addEventListener("click", async () => {
+      const tab = state.tabs.find(t => t.label === state.activeId);
+      if (tab) {
+        try {
+          await invoke("navigate_tab", {
+            label: tab.label,
+            url: tab.url,
+            app_origin: APP_ORIGIN,
+            doh_enabled: state.doh,
+            doh_provider: state.dohProvider,
+            permissions_denied: state.permissionsDenied,
+            block_third_party_cookies: state.blockThirdPartyCookies,
+            https_only: state.httpsOnly,
+            rules_json: state.filterRulesJson,
+          });
+        } catch (e) { toast("Ошибка перезагрузки: " + e, "danger"); }
+      }
+    });
+    document.getElementById("btnNewTab").addEventListener("click", () => {
+      createTab("tab-" + Date.now(), "");
+    });
+
+    // Burn session
+    document.getElementById("btnBurn").addEventListener("click", async () => {
+      if (!confirm("Сжечь сессию? Это удалит куки, кэш и локальное хранилище всех вкладок.")) return;
+      try {
+        await invoke("clear_browsing_data");
+        state.blockedCount = 0;
+        localStorage.setItem("difri:blockedCount", "0");
+        toast("Сессия сожжена — данные очищены", "ok");
+      } catch (e) {
+        toast("Не удалось очистить данные: " + e, "danger");
+      }
+    });
+
+    // Menu (inline dropdown)
+    const btnMenu = document.getElementById("btnMenu");
+    let menuOpen = false;
+    btnMenu.addEventListener("click", () => {
+      if (menuOpen) { menuOpen = false; document.getElementById("menu").remove(); return; }
+      menuOpen = true;
+      const menu = document.createElement("div");
+      menu.id = "menu";
+      menu.style.cssText = "position:fixed;top:92px;right:12px;background:#1a1a1a;border:1px solid var(--border);border-radius:10px;padding:8px;min-width:220px;z-index:2000;box-shadow:0 8px 32px rgba(0,0,0,0.4);";
+      menu.innerHTML = `
+        <div style="padding:6px 12px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;border-bottom:1px solid var(--border);margin-bottom:6px">Приватность</div>
+        <div class="menu-item" onclick="toggleShield()">${state.shield ? "Отключить щит приватности" : "Включить щит приватности"}</div>
+        <div class="menu-item" onclick="toggleCleaner()">${state.cleaner ? "Выключить очистку URL" : "Включить очистку URL (utm, fbclid и пр.)"}</div>
+        <div class="menu-item" onclick="toggleDoh()">${state.doh ? "Отключить DNS-over-HTTPS" : "Включить DNS-over-HTTPS"}</div>
+        <div class="menu-item" style="font-size:11px;color:var(--muted);padding:6px 12px;">DoH-провайдер: ${state.dohProvider}</div>
+        <div class="menu-item" onclick="togglePermissions()">${state.permissionsDenied ? "Отключить автоотказ разрешений" : "Включить автоотказ разрешений"}</div>
+        <div class="menu-item" onclick="toggleThirdPartyCookies()">${state.blockThirdPartyCookies ? "Разрешить сторонние куки" : "Блокировать сторонние куки (3rd-party)"}</div>
+        <div class="menu-item" onclick="toggleHttpsOnly()">${state.httpsOnly ? "Отключить HTTPS-only" : "Включить HTTPS-only"}</div>
+        <div class="menu-item" onclick="showPrivacyReport()">Отчёт о приватности за сессию</div>
+        <div class="menu-item" onclick="updateFilters()">Обновить список фильтров</div>
+        <div class="menu-item" onclick="toggleCosmeticBlocking()">${state.cosmeticBlocked ? "Отключить косметическую блокировку" : "Включить косметическую блокировку"}</div>
+        <div style="padding:4px 12px;font-size:11px;color:var(--muted);border-top:1px solid var(--border);margin-top:6px">Версия <span id="menuVer">…</span></div>
+        <div class="menu-item danger" onclick="burnSession()" style="color:var(--danger)">Сжечь сессию</div>
+      `;
+      menu.querySelectorAll(".menu-item").forEach(item => {
+        item.style.cssText = "padding:8px 12px;font-size:13px;cursor:pointer;border-radius:6px;";
+        item.onmouseenter = () => { item.style.background = "#262626"; };
+        item.onmouseleave = () => { item.style.background = "transparent"; };
+      });
+      document.body.appendChild(menu);
+      (async () => {
+        try { document.getElementById("menuVer").textContent = await invoke("app_version"); }
+        catch { document.getElementById("menuVer").textContent = "?"; }
+      })();
+      document.addEventListener("click", function closeMenu(e) {
+        if (!menu.contains(e.target) && e.target !== btnMenu) { menuOpen = false; menu.remove(); document.removeEventListener("click", closeMenu); }
+      });
+    });
+
+    window.toggleShield = async () => {
+      state.shield = !state.shield;
+      localStorage.setItem("difri:shield", String(state.shield));
+      toast(state.shield ? "Щит приватности включён" : "Щит отключён", state.shield ? "ok" : "muted");
+    };
+    window.toggleCleaner = async () => {
+      state.cleaner = !state.cleaner;
+      localStorage.setItem("difri:cleaner", String(state.cleaner));
+      toast(state.cleaner ? "Очистка URL включена" : "Очистка URL выключена", "muted");
+    };
+    window.toggleDoh = async () => {
+      state.doh = !state.doh;
+      localStorage.setItem("difri:doh:enabled", state.doh ? "1" : "0");
+      toast(state.doh ? `DNS-over-HTTPS включён (${state.dohProvider})` : `DNS-over-HTTPS выключен`, `muted`);
+    };
+    window.showPrivacyReport = async () => {
+      menuOpen = false; document.getElementById("menu").remove();
+      let stats = { blockedCount: 0, stats: {}, history: [] };
+      try {
+        const raw = await invoke("get_privacy_stats");
+        stats = typeof raw === "string" ? JSON.parse(raw) : raw;
+      } catch (_) {}
+      const modal = document.createElement("div");
+      modal.id = "privacy-report";
+      modal.style.cssText = "position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,0.8);display:flex;align-items:center;justify-content:center;";
+      const rows = Object.entries(stats.stats || {})
+        .sort((a,b) => b[1].count - a[1].count)
+        .slice(0, 15)
+        .map(([domain, info]) => `
+          <tr>
+            <td style="padding:6px 10px;border-bottom:1px solid #333;">${escapeHtml(domain)}</td>
+            <td style="padding:6px 10px;border-bottom:1px solid #333;text-align:center;color:#ff9999;">${info.count}</td>
+            <td style="padding:6px 10px;border-bottom:1px solid #333;color:#a0a0a0;font-size:11px;">${escapeHtml(info.category || '')}</td>
+          </tr>
+        `).join("") || `<tr><td colspan="3" style="padding:20px;color:#a0a0a0;text-align:center;">Нет заблокированных запросов за эту сессию.</td></tr>`;
+      modal.innerHTML = `
+        <div style="background:#161616;border:1px solid #2c2c2c;border-radius:16px;padding:24px;max-width:600px;width:90%;max-height:90vh;overflow-y:auto;box-shadow:0 12px 40px rgba(0,0,0,0.6);">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+            <h2 style="color:#eaeaea;">Отчёт о приватности за сессию</h2>
+            <button onclick="document.getElementById('privacy-report').remove()" style="all:unset;background:#262626;border:1px solid #444;color:#eaeaea;padding:6px 14px;border-radius:8px;cursor:pointer;font-size:13px;">Закрыть</button>
+          </div>
+          <div style="display:flex;gap:16px;margin-bottom:20px;">
+            <div style="flex:1;background:#1a1a1a;border:1px solid #2c2c2c;padding:16px;border-radius:12px;text-align:center;">
+              <div style="color:#a0a0a0;font-size:12px;">Заблокировано запросов</div>
+              <div style="color:#ff5555;font-size:28px;font-weight:bold;">${stats.blockedCount || 0}</div>
+            </div>
+            <div style="flex:1;background:#1a1a1a;border:1px solid #2c2c2c;padding:16px;border-radius:12px;text-align:center;">
+              <div style="color:#a0a0a0;font-size:12px;">Уникальных доменов</div>
+              <div style="color:#bd93f9;font-size:28px;font-weight:bold;">${Object.keys(stats.stats || {}).length}</div>
+            </div>
+          </div>
+          <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <thead>
+              <tr style="color:#a0a0a0;text-align:left;">
+                <th style="padding:8px 10px;border-bottom:1px solid #333;">Домен</th>
+                <th style="padding:8px 10px;border-bottom:1px solid #333;text-align:center;">Заблокировано</th>
+                <th style="padding:8px 10px;border-bottom:1px solid #333;">Категория</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+          <div style="margin-top:16px;padding:12px;background:#1a1a1a;border:1px solid #2c2c2c;border-radius:8px;color:#a0a0a0;font-size:12px;">
+            Данные хранятся только в памяти текущей сессии и стираются при перезагрузке браузера.
+          </div>
+        </div>
+      `;
+      document.body.appendChild(modal);
+      modal.addEventListener("click", (e) => { if (e.target === modal) modal.remove(); });
+    };
+    window.togglePermissions = async () => {
+      state.permissionsDenied = !state.permissionsDenied;
+      localStorage.setItem("difri:permissions:denied", state.permissionsDenied ? "1" : "0");
+      toast(state.permissionsDenied ? "Автоотказ разрешений включён" : "Автоотказ разрешений выключен", "muted");
+      // Пересоздаём активную вкладку с новыми настройками
+      const tab = state.tabs.find(t => t.label === state.activeId);
+      if (tab) navigateInTab(tab.url);
+    };
+    window.toggleThirdPartyCookies = async () => {
+      state.blockThirdPartyCookies = !state.blockThirdPartyCookies;
+      localStorage.setItem("difri:cookies:thirdparty", state.blockThirdPartyCookies ? "1" : "0");
+      toast(state.blockThirdPartyCookies ? "Блокировка сторонних куки включена" : "Блокировка сторонних куки выключена", "muted");
+      const tab = state.tabs.find(t => t.label === state.activeId);
+      if (tab) navigateInTab(tab.url);
+    };
+    window.toggleHttpsOnly = async () => {
+      state.httpsOnly = !state.httpsOnly;
+      localStorage.setItem("difri:https:only", state.httpsOnly ? "1" : "0");
+      toast(state.httpsOnly ? "HTTPS-only включён" : "HTTPS-only выключен", "muted");
+      const tab = state.tabs.find(t => t.label === state.activeId);
+      if (tab) navigateInTab(tab.url);
+    };
+    window.showDohProvider = async () => {
+      const providers = { cloudflare: "Cloudflare 1.1.1.1", google: "Google 8.8.8.8", quad9: "Quad9 9.9.9.9", adguard: "AdGuard 94.140.14.14" };
+      const current = providers[state.dohProvider] || state.dohProvider;
+      const choice = prompt(`Выберите DoH-провайдера:
+1. cloudflare (Cloudflare 1.1.1.1)
+2. google (Google 8.8.8.8)
+3. quad9 (Quad9 9.9.9.9)
+4. adguard (AdGuard 94.140.14.14)
+
+Текущий: ${current}
+
+Введите номер (1-4) или имя:`, state.dohProvider);
+      if (!choice) return;
+      const map = { "1": "cloudflare", "2": "google", "3": "quad9", "4": "adguard" };
+      const provider = map[choice] || choice;
+      if (provider in providers || ["cloudflare","google","quad9","adguard"].includes(provider)) {
+        state.dohProvider = provider;
+        localStorage.setItem("difri:doh:provider", provider);
+        toast("DoH-провайдер: " + (providers[provider] || provider), "muted");
+        const tab = state.tabs.find(t => t.label === state.activeId);
+        if (tab) navigateInTab(tab.url);
+      } else {
+        toast("Неверный выбор провайдера", "danger");
+      }
+    };
+    window.burnSession = async () => {
+      document.getElementById("btnBurn").click();
+      menuOpen = false; document.getElementById("menu").remove();
+    };
+
+    window.updateFilters = async () => {
+      menuOpen = false; document.getElementById("menu").remove();
+      try {
+        toast("Проверка обновлений фильтров...", "muted");
+        const raw = await invoke("update_filter_list");
+        const data = typeof raw === "string" ? JSON.parse(raw) : raw;
+        state.filterRulesJson = JSON.stringify(data);
+        localStorage.setItem("difri:rules:json", state.filterRulesJson);
+        // Применяем к активной вкладке
+        const tab = state.tabs.find(t => t.label === state.activeId);
+        if (tab) {
+          await invoke("navigate_tab", {
+            label: tab.label,
+            url: tab.url,
+            app_origin: APP_ORIGIN,
+            doh_enabled: state.doh,
+            doh_provider: state.dohProvider,
+            permissions_denied: state.permissionsDenied,
+            block_third_party_cookies: state.blockThirdPartyCookies,
+            https_only: state.httpsOnly,
+            rules_json: state.filterRulesJson,
+            cosmetic_blocked: state.cosmeticBlocked,
+          });
+        }
+        toast("Фильтры обновлены: " + (data.version || "?"), "ok");
+      } catch (e) {
+        toast("Не удалось обновить фильтры: " + e, "danger");
+      }
+    };
+
+    window.toggleCosmeticBlocking = async () => {
+      state.cosmeticBlocked = !state.cosmeticBlocked;
+      localStorage.setItem("difri:cosmetic:enabled", state.cosmeticBlocked ? "1" : "0");
+      toast(state.cosmeticBlocked ? "Косметическая блокировка включена" : "Косметическая блокировка выключена", "muted");
+      const tab = state.tabs.find(t => t.label === state.activeId);
+      if (tab) {
+        await invoke("navigate_tab", {
+          label: tab.label,
+          url: tab.url,
+          app_origin: APP_ORIGIN,
+          doh_enabled: state.doh,
+          doh_provider: state.dohProvider,
+          permissions_denied: state.permissionsDenied,
+          block_third_party_cookies: state.blockThirdPartyCookies,
+          https_only: state.httpsOnly,
+          rules_json: state.filterRulesJson,
+          cosmetic_blocked: state.cosmeticBlocked,
+        });
+      }
+    };
+
+    /* ===== Менеджер загрузок ===== */
+    state.downloads = [];
+
+    function toggleDownloads() {
+      const panel = document.getElementById("downloads-panel");
+      const isHidden = panel.style.display === "none";
+      panel.style.display = isHidden ? "flex" : "none";
+      if (isHidden) refreshDownloads();
+    }
+
+    document.getElementById("btnDownloads").addEventListener("click", toggleDownloads);
+
+    async function refreshDownloads() {
+      try {
+        state.downloads = await invoke("get_downloads");
+        renderDownloads();
+      } catch (e) {
+        console.error("refreshDownloads error:", e);
+      }
+    }
+
+    function renderDownloads() {
+      const list = document.getElementById("downloads-list");
+      if (!list) return;
+      if (state.downloads.length === 0) {
+        list.innerHTML = '<div style="padding:12px;color:#a0a0a0;text-align:center;font-size:13px;">Нет активных загрузок</div>';
+        return;
+      }
+      list.innerHTML = state.downloads.map(dl => {
+        const pct = dl.total_bytes ? Math.round((dl.received_bytes / dl.total_bytes) * 100) : 0;
+        const statusColor = {
+          Started: "#bd93f9",
+          Progress: "#50fa7b",
+          Completed: "#50fa7b",
+          Failed: "#ff5555",
+          Cancelled: "#ff5555",
+        }[dl.status] || "#a0a0a0";
+        return `
+          <div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:#1a1a1a;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+              <div style="font-size:12px;color:#eaeaea;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px;" title="${escapeHtml(dl.file_name)}">${escapeHtml(dl.file_name)}</div>
+              <span style="font-size:11px;color:${statusColor};font-weight:bold;">${dl.status}</span>
+            </div>
+            <div style="height:6px;background:#2c2c2c;border-radius:3px;overflow:hidden;margin-bottom:4px;">
+              <div style="height:100%;background:${statusColor};width:${pct}%;transition:width 0.2s;"></div>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:11px;color:#a0a0a0;">
+              <span>${formatBytes(dl.received_bytes)}${dl.total_bytes ? " / " + formatBytes(dl.total_bytes) : ""}</span>
+              <span>${pct}%</span>
+            </div>
+            <div style="display:flex;gap:6px;margin-top:6px;">
+              ${dl.status === "Started" || dl.status === "Progress"
+                ? `<button onclick="cancelDownload('${dl.id}')" style="all:unset;background:#262626;border:1px solid #ff5555;color:#ff5555;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px;">Отмена</button>`
+                : `<button onclick="openDownload('${dl.id}')" style="all:unset;background:#262626;border:1px solid #50fa7b;color:#50fa7b;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px;">Открыть</button>`}
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function formatBytes(bytes) {
+      if (bytes === 0 || bytes === null || bytes === undefined) return "0 B";
+      const k = 1024;
+      const sizes = ["B", "KB", "MB", "GB"];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+    }
+
+    async function promptDownload() {
+      const url = prompt("Введите URL для скачивания:", "");
+      if (!url) return;
+      toggleDownloads();
+      await downloadFile(url);
+    }
+
+    async function downloadFile(url) {
+      try {
+        const id = await invoke("download_start", { url });
+        toast("Скачивание начато: " + id, "ok");
+        await refreshDownloads();
+      } catch (e) {
+        toast("Ошибка скачивания: " + e, "danger");
+      }
+    }
+
+    async function cancelDownload(id) {
+      try {
+        await invoke("download_cancel", { id });
+        toast("Загрузка отменена", "muted");
+        await refreshDownloads();
+      } catch (e) {
+        toast("Ошибка отмены: " + e, "danger");
+      }
+    }
+
+    async function openDownload(id) {
+      try {
+        await invoke("download_open", { id });
+        toggleDownloads();
+      } catch (e) {
+        toast("Не удалось открыть файл: " + e, "danger");
+      }
+    }
+
+    // Инициализация при загрузке app.html в дефолтном вебвью
+    window.addEventListener("DOMContentLoaded", async () => {
+      await loadTabs();
+    });
+  </script>
+</body>
+</html>

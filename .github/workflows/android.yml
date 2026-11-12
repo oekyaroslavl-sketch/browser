@@ -1,0 +1,61 @@
+name: Build DiFri Privacy (Android APK)
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Add Android targets
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Init Tauri Android project
+        run: npm run tauri:android:init
+        env:
+          TAURI_ANDROID_MIN_SDK_VERSION: "24"
+
+      - name: Build Android APK
+        run: npm run tauri:android:build
+
+      - name: Locate and copy APK
+        run: |
+          mkdir -p out
+          APK=$(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -n 1)
+          if [ -z "$APK" ]; then echo "::error::APK not found"; exit 1; fi
+          cp "$APK" out/difri-privacy.apk
+          echo "APK: $APK"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: difri-privacy-android-apk
+          path: out/difri-privacy.apk
+          retention-days: 30

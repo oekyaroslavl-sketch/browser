@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Заблокировано · DiFri Privacy</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; background: #0a0a0a; color: #eaeaea;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  display: flex; align-items: center; justify-content: center;
+}
+.card { background: #161616; border: 1px solid #2c2c2c; border-radius: 16px;
+  padding: 40px 32px; max-width: 460px; width: 90%; text-align: center;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.5); }
+.shield { width: 72px; height: 72px; margin: 0 auto 20px; fill: none; stroke: #ff5555; stroke-width: 2; }
+h1 { color: #ff5555; margin-bottom: 10px; font-size: 20px; }
+p { color: #949494; line-height: 1.6; margin-bottom: 24px; }
+.reason { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 13px;
+  color: #ff9999; margin-bottom: 22px; word-break: break-all; }
+.btn { all: unset; display: inline-block; padding: 11px 24px; border-radius: 10px;
+  border: 1px solid #2c2c2c; color: #eaeaea; cursor: pointer; font-size: 14px; margin: 4px; }
+.btn:hover { border-color: #bd93f9; color: #bd93f9; }
+.btn.danger { border-color: #ff5555; color: #ff5555; }
+.btn.danger:hover { background: rgba(255,85,85,0.1); }
+</style>
+</head>
+<body>
+<div class="card">
+  <svg class="shield" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+    <path d="M12 2L4 5.4V11.2C4 16.55 7.41 21.54 12 22.8C16.59 21.54 20 16.55 20 11.2V5.4L12 2Z"/>
+    <path d="M17 17l-5-5 5-5" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>
+  <h1 id="title">Ресурс заблокирован</h1>
+  <p id="msg">Щит приватности не дал загрузить эту страницу.</p>
+  <div class="reason" id="reason"></div>
+  <div>
+    <button class="btn" onclick="window.parent.difri?.goHome?.() || window.location='/index.html'">На главную</button>
+    <button class="btn danger" onclick="window.parent.difri?.overrideBlock?.()" id="override">Открыть всё равно</button>
+  </div>
+</div>
+<script>
+const params = new URLSearchParams(location.search);
+if (params.get("r")) document.getElementById("reason").textContent = "Причина: " + decodeURIComponent(params.get("r"));
+if (params.get("u")) document.getElementById("msg").textContent = "Заблокировано: " + decodeURIComponent(params.get("u"));
+window.addEventListener("message", e => {
+  if (e.data && e.data === "difri:blocked") {
+    document.getElementById("override").style.display = "inline-block";
+  }
+});
+</script>
+</body>
+</html>

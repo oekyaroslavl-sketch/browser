@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/v2/config.json",
+  "productName": "DiFri Privacy",
+  "version": "2.1.0",
+  "identifier": "com.difri.privacy",
+  "build": {
+    "frontendDist": "gen/dist",
+    "devUrl": "http://127.0.0.1:5173/app.html",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "DiFri Privacy",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false,
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36 DiFri/2.1.0",
+        "decorations": true,
+        "url": "app.html"
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.ico"
+    ],
+    "resources": [],
+    "externalBin": [],
+    "copyright": "Copyright © 2026 DiFri Privacy",
+    "category": "Utilities"
+  }
+}

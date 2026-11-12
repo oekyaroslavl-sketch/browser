@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{command, generate_context, generate_handler, Manager, State, Webview};
+use tauri::{command, generate_context, generate_handler, State, Webview};
 
 /// Снимок статистики блокировок последней загруженной страницы (JSON).
 static PAGE_STATS: Mutex<String> = Mutex::new(String::new());

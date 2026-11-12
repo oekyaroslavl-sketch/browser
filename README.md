@@ -25,6 +25,22 @@ DiFri Privacy — ответвление (fork) идеи [DiFri](https://github.
 - **Сборка под Windows** — `.msi` / `.nsis` установщики через GitHub Actions.
 - **Сборка под Android** — APK через GitHub Actions (нет необходимости устанавливать Android SDK локально).
 
+## Исправления после сборки 2.1.0
+
+Чёрный экран навигации (`#stage` не заполнялся) и «молчащая» блокировка имели
+конкретные причины — все они устранены:
+
+| Симптом | Причина | Исправление |
+|---|---|---|
+| Чёрный экран, ввод адреса ничего не делает | `navigate_tab` вызывал `eval_with_callback` + `recv_timeout(5 с)` сразу после `navigate()`; новый документ к этому моменту ещё не создан, колбэк не приходил, команда возвращала `timeout`, JS уходил в `catch` | `navigate()` и `eval()` разведены: `eval_with_callback` в навигации больше не используется, ошибка перехода не пробрасывается в UI и показывает `error.html` |
+| Контент-скрипт не работал на сайтах | `eval` выполнялся до готовности документа | Добавлен `on_page_load(PageLoadEvent::Finished)` + страховочный таймер, защищённый флагом `INJECTED` от двойной инъекции |
+| Блокировка трекеров не срабатывала | `state.filterRulesJson` был `undefined`, Rust подставлял `{}`, который затирал встроенный `RULES` | Правила читаются из `localStorage`/`filter-rules.json`, Rust валидирует их и при пустом значении берёт встроенный список через `include_str!` |
+| «Обновить фильтры» отключало блокировку | `update_filter_list` скачивал `keywords.dat` и возвращал пустые `blockedDomains` | Загружается `filter-rules.json` из репозитория, пустой список отвергается валидатором |
+| `filter-rules.json` отсутствовал в сборке | `public/` одновременно `root` и `publicDir` — Vite не копировал файлы при явном `rollupOptions.input` | Плагин `copyStaticAssets` в `vite.config.ts` копирует json, иконки и `svg/` в `src-tauri/gen/dist` |
+| Вкладки исчезали после «+» | `new URL("")` бросал `TypeError` внутри `renderTabs()` | Хелпер `tabTitle()` с `try/catch` |
+| Клик по активной вкладке уводил в `app.html` | `focusTab` всегда вызывал `navigateInTab` | Навигация только при реальном переключении вкладки |
+| Actions не запускались | Триггер был `branches: [master]`, такой ветки нет; в `windows.yml` `Copy-Item` шёл до создания `out/` | Триггер на `main` и `master`, каталог создаётся первым, добавлены `pull_request`, Java и NDK для Android |
+
 ## Структура репозитория
 
 ```

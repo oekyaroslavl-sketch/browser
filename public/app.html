@@ -134,13 +134,39 @@
     .tab .close svg { width: 12px; height: 12px; fill: var(--muted); stroke: var(--muted); }
     .tab .close:hover svg { fill: #fff; stroke: #fff; }
 
-    /* Контентная область — здесь отображаются дочерние вебвью (нативные) */
+    /* Контентная область.
+       Модель — одиночный вебвью: когда сайт загружен, весь документ app.html
+       заменяется страницей сайта, и этот блок виден только на старте.
+       Раньше здесь был пустой чёрный прямоугольник — теперь видимая заглушка. */
     #stage {
       flex: 1;
       position: relative;
-      background: #0a0a0a;
+      background: radial-gradient(circle at 50% 40%, #17151f 0%, #0a0a0a 70%);
       margin-top: 92px; /* toolbar 52 + tabstrip 40 */
-      overflow: hidden;
+      overflow: auto;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .stage-hint {
+      text-align: center;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.7;
+      max-width: 520px;
+      padding: 24px;
+    }
+    .stage-hint .big { font-size: 20px; color: var(--text); margin-bottom: 10px; font-weight: 600; }
+    .stage-hint kbd {
+      background: #222; border: 1px solid var(--border); border-radius: 5px;
+      padding: 2px 6px; font-size: 12px; color: var(--text);
+    }
+    .stage-hint .features {
+      margin-top: 18px; display: flex; flex-wrap: wrap; gap: 8px; justify-content: center;
+    }
+    .stage-hint .pill {
+      background: #161616; border: 1px solid var(--border); border-radius: 999px;
+      padding: 5px 12px; font-size: 12px; color: var(--accent);
     }
 
     /* Статус тулбар */
@@ -215,7 +241,16 @@
     </div>
 
     <div id="stage">
-      <!-- Дочерние вебвью отображаются здесь (нативные, через Tauri add_child) -->
+      <div class="stage-hint">
+        <div class="big">Введите адрес, чтобы начать</div>
+        <div>Например: <kbd>facebook.com</kbd> или поисковый запрос — он уйдёт в DuckDuckGo.</div>
+        <div class="features">
+          <span class="pill">Блокировка трекеров</span>
+          <span class="pill">DNS-over-HTTPS</span>
+          <span class="pill">Очистка URL</span>
+          <span class="pill">Антифингерпринтинг</span>
+        </div>
+      </div>
     </div>
     <div id="downloads-panel" style="display:none;position:fixed;top:92px;right:12px;width:340px;background:#161616;border:1px solid var(--border);border-radius:12px;z-index:2000;box-shadow:0 12px 40px rgba(0,0,0,0.6);flex-direction:column;max-height:500px;">
       <div style="padding:12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
@@ -247,6 +282,10 @@
       permissionsDenied: localStorage.getItem("difri:permissions:denied") === "1",
       blockThirdPartyCookies: localStorage.getItem("difri:cookies:thirdparty") === "1",
       httpsOnly: localStorage.getItem("difri:https:only") === "1",
+      cosmeticBlocked: localStorage.getItem("difri:cosmetic:enabled") !== "0",
+      // JSON правил фильтрации. Строка, а не объект — Rust ждёт String.
+      // undefined здесь приводил к падению invoke() на сериализации.
+      filterRulesJson: localStorage.getItem("difri:rules:json") || null,
       tabs: [],           // { label, url }
       activeId: null,
       blockedCount: Number(localStorage.getItem("difri:blockedCount") || "0"),
@@ -290,7 +329,7 @@
     function renderTabs() {
       els.strip.innerHTML = state.tabs.map(tab => `
         <div class="tab ${tab.label === state.activeId ? "active" : ""}" id="tab-${tab.label}" data-label="${tab.label}">
-          <span class="title">${escapeHtml(new URL(tab.url).hostname || tab.label)}</span>
+          <span class="title">${escapeHtml(tabTitle(tab))}</span>
           <button class="close" data-label="${tab.label}" title="Закрыть вкладку">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
@@ -302,6 +341,14 @@
       els.strip.querySelectorAll(".tab:not(.close)").forEach(el => {
         el.addEventListener("click", () => focusTab(el.dataset.label));
       });
+    }
+
+    // Заголовок вкладки. new URL("") бросает TypeError — раньше это ломало
+    // renderTabs() и все вкладки исчезали после нажатия «+».
+    function tabTitle(tab) {
+      if (!tab || !tab.url) return tab?.label || "Новая вкладка";
+      try { return new URL(tab.url).hostname || tab.label; }
+      catch { return tab.label; }
     }
 
     function escapeHtml(t) {
@@ -345,11 +392,14 @@
     async function focusTab(label) {
       const tab = state.tabs.find(t => t.label === label);
       if (!tab) return;
+      const wasActive = state.activeId === label;
       state.activeId = label;
       saveTabs();
       syncUrlBar(tab.url);
       renderTabs();
-      if (tab.url) await navigateInTab(tab.url);
+      // Повторная навигация по уже открытой вкладке перезагружала страницу:
+      // сейчас на экране сайт, а клик по его же вкладке уводил на app.html.
+      if (!wasActive && tab.url) await navigateInTab(tab.url);
     }
 
     async function closeTab(label) {
@@ -375,6 +425,10 @@
       const tab = state.tabs.find(t => t.label === state.activeId);
       if (!tab) return;
 
+      // Контент-скрипт должен работать всегда: раньше пустой JSON правил
+      // доезжал до Rust и обнулял встроенный блоклист.
+      if (!state.filterRulesJson) await loadFilterRules();
+
       try {
         await invoke("navigate_tab", {
           label: tab.label,
@@ -392,7 +446,7 @@
         saveTabs();
         syncUrlBar(target);
         renderTabs();
-        toast("Переход: " + new URL(target).hostname);
+        toast("Переход: " + tabTitle({ label: tab.label, url: target }));
       } catch (e) {
         console.error("navigate_tab error:", e);
         toast("Ошибка навигации: " + e, "danger");
@@ -778,9 +832,33 @@
       }
     }
 
+    // Правила фильтрации: сначала localStorage (могли обновиться), затем файл.
+    async function loadFilterRules() {
+      try {
+        const res = await fetch("./filter-rules.json", { cache: "no-cache" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        state.filterRulesJson = JSON.stringify(data);
+        try { localStorage.setItem("difri:rules:json", state.filterRulesJson); } catch (_) {}
+        return true;
+      } catch (e) {
+        console.error("loadFilterRules error:", e);
+        // Фолбэк: пусть Rust подставит встроенный список (include_str!).
+        state.filterRulesJson = null;
+        return false;
+      }
+    }
+
     // Инициализация при загрузке app.html в дефолтном вебвью
     window.addEventListener("DOMContentLoaded", async () => {
+      await loadFilterRules();
       await loadTabs();
+      if (!state.tabs.length) {
+        state.activeId = "tab-main";
+        state.tabs.push({ label: "tab-main", url: "" });
+        saveTabs();
+        renderTabs();
+      }
     });
   </script>
 </body>

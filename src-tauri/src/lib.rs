@@ -1,13 +1,135 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{command, generate_context, generate_handler, AppHandle, Manager, State, Webview};
+use tauri::{command, generate_context, generate_handler, Manager, State, Webview};
 
 /// Снимок статистики блокировок последней загруженной страницы (JSON).
 static PAGE_STATS: Mutex<String> = Mutex::new(String::new());
+
+/// Параметры инъекции контент-скрипта, сохранённые последним вызовом `navigate_tab`.
+///
+/// Зачем: `webview.navigate(url)` заменяет документ, и скрипт, введённый через `eval`
+/// сразу после навигации, теряется вместе со старым документом. Поэтому скрипт
+/// вводится повторно в обработчике `PageLoad`, когда новый документ уже создан.
+static INJECTION: Mutex<Option<InjectionConfig>> = Mutex::new(None);
+
+/// Признак, что контент-скрипт уже введён в документ текущей навигации.
+/// Нужен, чтобы страховочный таймер не вставлял скрипт второй раз
+/// (двойной перехват fetch/XHR удваивал бы счётчик блокировок).
+static INJECTED: Mutex<bool> = Mutex::new(false);
+
+#[derive(Clone)]
+struct InjectionConfig {
+    app_origin: String,
+    label: String,
+    doh_enabled: bool,
+    doh_provider: String,
+    permissions_denied: bool,
+    block_third_party_cookies: bool,
+    https_only: bool,
+    rules_json: String,
+    cosmetic_blocked: bool,
+}
+
+/// Нормализует ввод пользователя в абсолютный URL.
+fn normalize_url(target: &str) -> Result<String, String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return Err("empty URL".to_string());
+    }
+    if trimmed.starts_with("about:") || trimmed.starts_with("data:") {
+        return Ok(trimmed.to_string());
+    }
+    let mut href = trimmed.to_string();
+    if !href.contains("://") {
+        let looks_like_host = href.contains('.') && !href.contains(' ');
+        href = if looks_like_host {
+            format!("https://{}", href)
+        } else {
+            format!(
+                "https://html.duckduckgo.com/html/?q={}",
+                percent_encode(&href)
+            )
+        };
+    }
+    match href.parse::<tauri::Url>() {
+        Ok(u) => {
+            let scheme = u.scheme();
+            if scheme != "http" && scheme != "https" {
+                return Err(format!("unsupported scheme: {}", scheme));
+            }
+            Ok(href)
+        }
+        Err(e) => Err(format!("invalid URL: {}", e)),
+    }
+}
+
+/// Percent-кодирование (поисковые запросы и адреса для error.html).
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for b in input.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Собирает префикс с настройками приватности + сам контент-скрипт.
+fn build_content_script(cfg: &InjectionConfig) -> String {
+    let j = |v: &str| serde_json::to_string(v).unwrap_or_else(|_| "\"\"".to_string());
+    let prefix = format!(
+        "window.__difriAppOrigin = {};\n\
+         window.__difriDoh = {{ enabled: {}, provider: {} }};\n\
+         window.__difriPermissions = {{ denied: {} }};\n\
+         window.__difriCookies = {{ blockThirdPartyCookies: {} }};\n\
+         window.__difriHttps = {{ httpsOnly: {} }};\n\
+         window.__difriTabLabel = {};\n\
+         window.__difriRulesUpdate = {{ json: {} }};\n\
+         window.__difriCosmetic = {{ cosmeticBlocking: {} }};\n\
+         window.__difriRules = {};\n",
+        j(&cfg.app_origin),
+        cfg.doh_enabled,
+        j(&cfg.doh_provider),
+        cfg.permissions_denied,
+        cfg.block_third_party_cookies,
+        cfg.https_only,
+        j(&cfg.label),
+        cfg.rules_json,
+        cfg.cosmetic_blocked,
+        cfg.rules_json,
+    );
+    format!("{}{}", prefix, include_str!("../../public/content-script.js"))
+}
+
+/// Забирает снимок статистики блокировок из sessionStorage страницы.
+///
+/// `eval_with_callback` здесь безопасен: результат нужен синхронно, а вызов
+/// делается только по явному запросу (отчёт о приватности), а не при навигации —
+/// раньше ожидание с `recv_timeout(5с)` висело на каждом переходе и вешало UI.
+async fn snapshot_page_stats(webview: Webview) -> Option<String> {
+    let snapshot = r#"(function(){ try { return JSON.stringify({ blockedCount: parseInt(sessionStorage.getItem('difri:cs:blocked')||'0',10), stats: JSON.parse(sessionStorage.getItem('difri:cs:stats')||'{}') }); } catch(e) { return '{}'; } })()"#;
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    webview
+        .eval_with_callback(snapshot, move |res| {
+            let _ = tx.send(res);
+        })
+        .ok()?;
+    let data = tokio::task::spawn_blocking(move || {
+        rx.recv_timeout(std::time::Duration::from_secs(3)).ok()
+    })
+    .await
+    .ok()??;
+    if data.trim().is_empty() {
+        None
+    } else {
+        Some(data)
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 enum DownloadStatus {
@@ -389,47 +511,69 @@ async fn doh_resolve(hostname: String, provider: String) -> Result<DohResult, St
 
 /// Возвращает статистику блокировок за текущую сессию из активной вкладки.
 #[command]
-async fn get_privacy_stats() -> Result<String, String> {
-    Ok(PAGE_STATS.lock().map(|g| g.clone()).unwrap_or_default())
+async fn get_privacy_stats(webview: Webview) -> Result<String, String> {
+    if let Some(fresh) = snapshot_page_stats(webview).await {
+        if let Ok(mut guard) = PAGE_STATS.lock() {
+            *guard = fresh.clone();
+        }
+        return Ok(fresh);
+    }
+    Ok(PAGE_STATS
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| "{}".to_string()))
 }
 
+/// Обновляет список фильтров из собственного репозитория.
+///
+/// Раньше функция скачивала `keywords.dat` (список цензуры апстрима) и
+/// возвращала заведомо пустые `blockedDomains`/`blockedUrlPatterns`, поэтому
+/// «Обновить список фильтров» стирало блокировку вместо обновления.
+/// Теперь берётся filter-rules.json и валидируется перед возвратом.
 #[command]
 async fn update_filter_list() -> Result<String, String> {
-    let client = reqwest::Client::new();
-    let url = "https://raw.githubusercontent.com/DiFri/DiFri-Python/Desktop/src/browser/keywords.dat";
+    const SOURCES: [&str; 2] = [
+        "https://raw.githubusercontent.com/oekyaroslavl-sketch/browser/main/public/filter-rules.json",
+        "https://raw.githubusercontent.com/oekyaroslavl-sketch/browser/arena/72386f61-browser/public/filter-rules.json",
+    ];
 
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch filter list: {}", e))?;
+    let client = reqwest::Client::builder()
+        .user_agent("DiFri-Privacy/2.1")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("cannot create HTTP client: {}", e))?;
 
-    if !resp.status().is_success() {
-        return Err(format!("Filter list server returned status {}", resp.status()));
+    let mut last_error = String::from("no sources configured");
+    for url in SOURCES {
+        match client.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(v) if validate_rules(&v) => {
+                        return serde_json::to_string(&v)
+                            .map_err(|e| format!("cannot serialize rules: {}", e));
+                    }
+                    Ok(_) => last_error = format!("{} returned invalid rules", url),
+                    Err(e) => last_error = format!("{} returned malformed JSON: {}", url, e),
+                },
+                Err(e) => last_error = format!("{} read error: {}", url, e),
+            },
+            Ok(resp) => last_error = format!("{} returned status {}", url, resp.status()),
+            Err(e) => last_error = format!("{} request failed: {}", url, e),
+        }
     }
 
-    let _text = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read filter list: {}", e))?;
+    Err(last_error)
+}
 
-    // Заготовка обновления правил: контент-скрипт принимает эту структуру
-    // через window.__difriRulesUpdate. В production правила стоит публиковать
-    // в формате filter-rules.json и раздавать из своего GitHub-репозитория.
-    let update_json = serde_json::json!({
-        "version": SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs().to_string())
-            .unwrap_or_else(|_| "unknown".to_string()),
-        "name": "DiFri Privacy Updated Filter List",
-        "blockedDomains": [],
-        "blockedUrlPatterns": [],
-        "trackingQueryParams": [],
-        "domainCategories": {}
-    })
-    .to_string();
-
-    Ok(update_json)
+/// Минимальная проверка структуры правил перед применением.
+fn validate_rules(v: &serde_json::Value) -> bool {
+    let domains = v
+        .get("blockedDomains")
+        .and_then(|d| d.as_array())
+        .map(|a| a.iter().filter(|x| x.as_str().is_some()).count())
+        .unwrap_or(0);
+    // Пустой список хуже, чем ничего: он отключил бы блокировку.
+    domains > 0
 }
 
 /// Параметры навигации для конкретной вкладки.
@@ -451,62 +595,103 @@ fn navigate_tab(
     rules_json: Option<String>,
     cosmetic_blocked: Option<bool>,
 ) -> Result<(), String> {
-    let parsed: tauri::Url = url.parse().map_err(|e| format!("invalid URL: {}", e))?;
-    webview.navigate(parsed).map_err(|e| e.to_string())?;
+    // Правила: приоритет у переданных из UI, иначе — встроенный файл.
+    // До этого `{}` попадал в контент-скрипт и затирал его встроенный RULES
+    // пустым объектом — блокировка переставала работать после первого перехода.
+    let rules = match rules_json {
+        Some(r) if r.trim().len() > 2 && r.trim() != "{}" => r,
+        _ => include_str!("../../public/filter-rules.json").to_string(),
+    };
 
-    let doh_enabled = doh_enabled.unwrap_or(false);
-    let doh_provider = doh_provider.unwrap_or_else(|| "cloudflare".to_string());
-    let permissions_denied = permissions_denied.unwrap_or(false);
-    let block_third_party_cookies = block_third_party_cookies.unwrap_or(false);
-    let https_only = https_only.unwrap_or(false);
-    let rules_json = rules_json.as_deref().unwrap_or("{}");
-    let cosmetic_blocked = cosmetic_blocked.unwrap_or(false);
+    let cfg = InjectionConfig {
+        app_origin: app_origin.clone(),
+        label: label.clone(),
+        doh_enabled: doh_enabled.unwrap_or(false),
+        doh_provider: doh_provider.unwrap_or_else(|| "cloudflare".to_string()),
+        permissions_denied: permissions_denied.unwrap_or(false),
+        block_third_party_cookies: block_third_party_cookies.unwrap_or(false),
+        https_only: https_only.unwrap_or(false),
+        rules_json: rules,
+        cosmetic_blocked: cosmetic_blocked.unwrap_or(false),
+    };
 
-    let prefix = format!(
-        "window.__difriAppOrigin = {};\nwindow.__difriDoh = {{ enabled: {}, provider: {} }};\nwindow.__difriPermissions = {{ denied: {} }};\nwindow.__difriCookies = {{ blockThirdPartyCookies: {} }};\nwindow.__difriHttps = {{ httpsOnly: {} }};\nwindow.__difriTabLabel = {};\nwindow.__difriRulesUpdate = {{ json: {} }};\nwindow.__difriCosmetic = {{ cosmeticBlocking: {} }};\n",
-        serde_json::to_string(&app_origin).unwrap_or_else(|_| "\"\"".to_string()),
-        serde_json::to_string(&doh_enabled).unwrap_or_else(|_| "false".to_string()),
-        serde_json::to_string(&doh_provider).unwrap_or_else(|_| "\"cloudflare\"".to_string()),
-        serde_json::to_string(&permissions_denied).unwrap_or_else(|_| "false".to_string()),
-        serde_json::to_string(&block_third_party_cookies).unwrap_or_else(|_| "false".to_string()),
-        serde_json::to_string(&https_only).unwrap_or_else(|_| "false".to_string()),
-        serde_json::to_string(&label).unwrap_or_else(|_| "\"main\"".to_string()),
-        rules_json,
-        cosmetic_blocked
-    );
-    let script = format!("{}{}", prefix, include_str!("../../public/content-script.js"));
+    // Запоминаем настройки: их применит обработчик PageLoad к новому документу.
+    if let Ok(mut guard) = INJECTION.lock() {
+        *guard = Some(cfg.clone());
+    }
+    if let Ok(mut done) = INJECTED.lock() {
+        *done = false;
+    }
 
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    webview
-        .eval_with_callback(script, move |_res| {
-            let _ = tx.send(String::new());
-        })
-        .map_err(|e| e.to_string())?;
-    rx.recv_timeout(std::time::Duration::from_secs(5))
-        .map_err(|e| format!("timeout: {}", e))?;
+    let target = normalize_url(&url)?;
 
-    // Р§РµСЂРµР· РЅРµСЃРєРѕР»СЊРєРѕ СЃРµРєСѓРЅРґ СЃРЅРёРјР°РµРј СЃС‚Р°С‚РёСЃС‚РёРєСѓ Р±Р»РѕРєРёСЂРѕРІРѕРє СЃРѕ СЃС‚СЂР°РЅРёС†С‹:
-    // РєРѕРЅС‚РµРЅС‚-СЃРєСЂРёРїС‚ РїРёС€РµС‚ РµС‘ РІ sessionStorage РїСЂРѕРёСЃС…РѕР¶РґРµРЅРёСЏ СЃР°Р№С‚Р°.
-    let wv = webview.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-        let (tx2, rx2) = std::sync::mpsc::channel::<String>();
-        let snapshot = r#"(function(){ try { return { blockedCount: parseInt(sessionStorage.getItem('difri:cs:blocked')||'0',10), stats: JSON.parse(sessionStorage.getItem('difri:cs:stats')||'{}') }; } catch(e) { return {}; } })()"#;
-        if wv
-            .eval_with_callback(snapshot, move |res| {
-                let _ = tx2.send(res);
-            })
-            .is_ok()
-        {
-            if let Ok(data) = rx2.recv_timeout(std::time::Duration::from_secs(5)) {
-                if let Ok(mut guard) = PAGE_STATS.lock() {
-                    *guard = data;
+    // Если это внутренняя страница приложения — переключаемся на неё без инъекции
+    // контент-скрипта на сам app.html (иначе панель встроится в интерфейс браузера).
+    let is_app_page = cfg.app_origin != "null"
+        && !cfg.app_origin.is_empty()
+        && target.starts_with(&cfg.app_origin);
+
+    let parsed: tauri::Url = target
+        .parse()
+        .map_err(|e| format!("invalid URL: {}", e))?;
+
+    if is_app_page {
+        if let Ok(mut guard) = INJECTION.lock() {
+            *guard = None;
+        }
+    }
+
+    // Навигация. Ошибку не пробрасываем наверх: на Windows неудачный переход
+    // раньше оставлял UI в подвешенном состоянии, потому что JS ждал промис.
+    if let Err(e) = webview.navigate(parsed.clone()) {
+        eprintln!("[difri] navigate failed: {e}");
+        show_error_page(&webview, &target);
+        return Ok(());
+    }
+
+    // Страховка: контент-скрипт вводится и по PageLoad, и здесь с задержкой —
+    // если PageLoad::Finished не придёт (страница с ошибкой, кэш, медленный CPU),
+    // приватность всё равно включится.
+    if !is_app_page {
+        let wv = webview.clone();
+        let cfg2 = cfg.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            let already = INJECTED.lock().map(|g| *g).unwrap_or(false);
+            if already {
+                return;
+            }
+            if wv.eval(&build_content_script(&cfg2)).is_ok() {
+                if let Ok(mut done) = INJECTED.lock() {
+                    *done = true;
                 }
             }
-        }
-    });
+        });
+    }
 
     Ok(())
+}
+
+/// Переходит на внутреннюю страницу ошибки, если сайт открыть не удалось.
+fn show_error_page(webview: &Webview, target: &str) {
+    let encoded = percent_encode(target);
+    let _ = webview.eval(&format!(
+        "window.__difriFailedUrl = {};",
+        serde_json::to_string(target).unwrap_or_else(|_| "\"\"".to_string())
+    ));
+    // Внутренние страницы живут по tauri://localhost/ (Windows) или
+    // http://tauri.localhost/ — точный адрес отдаёт сам WebView2.
+    if let Ok(base) = webview.url() {
+        let origin = format!(
+            "{}://{}",
+            base.scheme(),
+            base.host_str().unwrap_or("tauri.localhost")
+        );
+        let path = base.path().rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        if let Ok(url) = format!("{}{}/error.html#{}", origin, path, encoded).parse::<tauri::Url>() {
+            let _ = webview.navigate(url);
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -528,7 +713,35 @@ pub fn run() {
             get_downloads,
             update_filter_list
         ])
-        .setup(|_app| {
+        .setup(|app| {
+            // Инъекция контент-скрипта в каждый загруженный документ.
+            // `PageLoadEvent::Finished` наступает, когда WebView2 уже создал документ,
+            // поэтому `eval` попадает в актуальный контекст, а не в предыдущий.
+            if let Some(window) = app.get_webview_window("main") {
+                window.on_page_load(move |webview, payload| {
+                    match payload.event() {
+                        tauri::webview::PageLoadEvent::Finished => {}
+                        _ => return,
+                    }
+                    // На внутренних страницах контент-скрипт не нужен:
+                    // он рисует панель поверх интерфейса самого браузера.
+                    let url = payload.url().to_string();
+                    if url.contains("app.html")
+                        || url.contains("index.html")
+                        || url.contains("blocked.html")
+                    {
+                        return;
+                    }
+                    let cfg = INJECTION.lock().ok().and_then(|g| g.clone());
+                    if let Some(cfg) = cfg {
+                        if webview.eval(&build_content_script(&cfg)).is_ok() {
+                            if let Ok(mut done) = INJECTED.lock() {
+                                *done = true;
+                            }
+                        }
+                    }
+                });
+            }
             Ok(())
         })
         .run(generate_context!())

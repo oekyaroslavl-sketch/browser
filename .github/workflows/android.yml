@@ -2,7 +2,9 @@ name: Build DiFri Privacy (Android APK)
 
 on:
   push:
-    branches: [master]
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
   workflow_dispatch:
 
 permissions:
@@ -34,16 +36,33 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup NDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "ndk;27.0.12077973" > /dev/null
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
       - name: Install npm dependencies
-        run: npm ci
+        run: npm ci || npm install
+
+      - name: Build frontend
+        run: npx vite build
 
       - name: Init Tauri Android project
-        run: npm run tauri:android:init
+        run: npx tauri android init --ci
         env:
           TAURI_ANDROID_MIN_SDK_VERSION: "24"
 
       - name: Build Android APK
-        run: npm run tauri:android:build
+        run: npx tauri android build --apk --ci
+        env:
+          NDK_HOME: ${{ env.NDK_HOME }}
 
       - name: Locate and copy APK
         run: |
@@ -58,4 +77,5 @@ jobs:
         with:
           name: difri-privacy-android-apk
           path: out/difri-privacy.apk
+          if-no-files-found: error
           retention-days: 30

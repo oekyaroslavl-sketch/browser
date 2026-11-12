@@ -841,6 +841,21 @@
     updateDohBadge();
   }
 
+  // Настройки, пришедшие из Rust (window.__difriRules), важнее встроенных.
+  // Иначе обновлённый список фильтров никогда не применялся.
+  (function applyInjectedRules() {
+    try {
+      const injected = window.__difriRules || window.__difriRulesUpdate?.json;
+      const rules = typeof injected === 'string' ? JSON.parse(injected) : injected;
+      if (!rules || typeof rules !== 'object') return;
+      if (Array.isArray(rules.blockedDomains) && rules.blockedDomains.length) {
+        RULES = rules;
+      }
+    } catch (e) {
+      console.warn('[DiFri] cannot apply injected rules:', e);
+    }
+  })();
+
   // DoH переключатель доступен через window.__difriCS
   window.__difriCS.setDoh = function(enabled, provider) {
     dohEnabled = enabled;
@@ -850,18 +865,18 @@
     updateDohBadge();
   };
 
+  window.__difriCS = {
+    blockedCount: () => blockedCount,
+    rules: () => RULES,
+    isBlocked: isBlocked,
+    stripTracking: stripTracking
+  };
+
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', injectToolbar);
   } else {
     injectToolbar();
   }
-
-  window.__difriCS = {
-    blockedCount: () => blockedCount,
-    rules: RULES,
-    isBlocked: isBlocked,
-    stripTracking: stripTracking
-  };
 
   console.log('[DiFri Content Script] Active. Rules:', DOMAINS.size, 'domains | Anti-fingerprinting: ON');
 })();

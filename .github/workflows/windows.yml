@@ -2,7 +2,9 @@ name: Build DiFri Privacy (Windows)
 
 on:
   push:
-    branches: [master]
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
   workflow_dispatch:
   release:
     types: [published]
@@ -30,8 +32,13 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install npm dependencies
+        # `npm ci` требует синхронизированного package-lock.json.
+        # Если lock устарел — откатываемся на `npm install`, чтобы сборка не падала.
+        run: npm ci || npm install
+
+      - name: Build frontend
+        run: npx vite build
 
       - name: Build with Tauri
         run: npm run tauri:build
@@ -41,12 +48,18 @@ jobs:
       - name: Collect Windows installers
         shell: pwsh
         run: |
-          Get-ChildItem src-tauri/target/release/bundle -Recurse | Where-Object { $_.Extension -in @('.msi', '.nsis', '.exe') } | ForEach-Object { Copy-Item $_.FullName -Destination ./out/ -Force }
           New-Item -ItemType Directory -Force -Path out | Out-Null
+          Get-ChildItem src-tauri/target/release/bundle -Recurse -File |
+            Where-Object { $_.Extension -in @('.msi', '.exe') } |
+            ForEach-Object { Copy-Item $_.FullName -Destination ./out/ -Force }
+          Get-ChildItem out | Format-Table Name, Length
 
       - name: Upload installers
         uses: actions/upload-artifact@v4
         with:
           name: difri-privacy-windows
-          path: out/*.{msi,nsis,exe}
+          path: |
+            out/*.msi
+            out/*.exe
+          if-no-files-found: error
           retention-days: 14

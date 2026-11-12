@@ -254,7 +254,7 @@ async fn download_start(
 
     tauri::async_runtime::spawn(async move {
         let client = reqwest::Client::new();
-        let mut total: Option<u64> = None;
+        let total: Option<u64>;
         let mut received: u64 = 0;
         let mut failed = false;
 
@@ -717,8 +717,10 @@ pub fn run() {
             // Инъекция контент-скрипта в каждый загруженный документ.
             // `PageLoadEvent::Finished` наступает, когда WebView2 уже создал документ,
             // поэтому `eval` попадает в актуальный контекст, а не в предыдущий.
-            if let Some(window) = app.get_webview_window("main") {
-                window.on_page_load(move |webview, payload| {
+            // on_page_load объявлен на Webview, не на WebviewWindow —
+            // поэтому берём именно вебвью, иначе CI роняет сборку.
+            if let Some(webview) = app.get_webview("main") {
+                webview.on_page_load(move |webview, payload| {
                     match payload.event() {
                         tauri::webview::PageLoadEvent::Finished => {}
                         _ => return,

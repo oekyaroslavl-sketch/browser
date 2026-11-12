@@ -25,6 +25,12 @@ jobs:
           node-version: "lts/*"
           cache: npm
 
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -33,20 +39,31 @@ jobs:
       - name: Add Android targets
         run: rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Setup NDK
+      # android-actions/setup-android@v3 падал на этом раннере, а SDK и NDK
+      # в образе ubuntu-latest уже есть — используем их напрямую.
+      - name: Locate Android SDK and NDK
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "ndk;27.0.12077973" > /dev/null
-          echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          set -e
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          if [ -d "$SDK/ndk" ]; then
+            NDK=$(ls -d "$SDK"/ndk/* | sort -V | tail -n 1)
+            echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          fi
+          echo "sdk: $SDK"
+          echo "ndk: ${NDK:-not bundled, will install}"
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" --version || true
+
+      - name: Ensure NDK is installed
+        run: |
+          set -e
+          SDK="$ANDROID_HOME"
+          if [ -z "$NDK_HOME" ] || [ ! -d "$NDK_HOME" ]; then
+            yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+            "$SDK/cmdline-tools/latest/bin/sdkmanager" "ndk;27.0.12077973"
+            echo "NDK_HOME=$SDK/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          fi
 
       - name: Install npm dependencies
         run: npm ci || npm install
@@ -59,23 +76,24 @@ jobs:
         env:
           TAURI_ANDROID_MIN_SDK_VERSION: "24"
 
+      # Debug-APK подписывается автоматически debug-ключом и ставится на
+      # устройство без keystore. Для release-сборки нужны secrets с ключом.
       - name: Build Android APK
-        run: npx tauri android build --apk --ci
-        env:
-          NDK_HOME: ${{ env.NDK_HOME }}
+        run: npx tauri android build --apk --debug --ci
 
       - name: Locate and copy APK
         run: |
+          set -e
           mkdir -p out
           APK=$(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -n 1)
-          if [ -z "$APK" ]; then echo "::error::APK not found"; exit 1; fi
-          cp "$APK" out/difri-privacy.apk
+          if [ -z "$APK" ]; then echo "::error::APK not found"; find src-tauri/gen/android -name '*.apk' || true; exit 1; fi
+          cp "$APK" out/difri-privacy-debug.apk
           echo "APK: $APK"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: difri-privacy-android-apk
-          path: out/difri-privacy.apk
+          path: out/difri-privacy-debug.apk
           if-no-files-found: error
           retention-days: 30

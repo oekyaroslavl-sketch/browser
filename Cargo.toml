@@ -10,6 +10,9 @@ members = [
     "crates/plo_wasm",
     "crates/plo_desktop_commands",
 ]
+exclude = [
+    "apps/plo_desktop/src-tauri",
+]
 
 [workspace.package]
 version = "0.1.0"

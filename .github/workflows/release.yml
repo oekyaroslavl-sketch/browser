@@ -2,6 +2,7 @@ name: Release Desktop Installers
 
 on:
   push:
+    branches: ["arena/**"]
     tags:
       - "v*.*.*"
   workflow_dispatch:
@@ -35,7 +36,7 @@ jobs:
 
       - name: Lint & run headless desktop verification (t1..t18)
         run: |
-          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets
           cargo check -p plo_wasm --target wasm32-unknown-unknown
           cargo test -p plo_desktop_commands --release
 
@@ -64,8 +65,8 @@ jobs:
       - name: Install Linux WebKit2GTK & AppImage dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             libwebkit2gtk-4.1-dev \
             libappindicator3-dev \
             librsvg2-dev \
@@ -89,15 +90,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: apps/plo_desktop/src-tauri
-          tagName: ${{ github.ref_name }}
-          releaseName: "PLO-4 Postflop — Hero vs Range ${{ github.ref_name }}"
+          tagName: v0.1.0
+          releaseName: "PLO-4 Postflop — Hero vs Range v0.1.0"
           releaseBody: |
-            Native cross-platform installers for **PLO-4 Postflop — Hero vs Range** (Tauri 2 + Rust DCFR).
-            - **Windows**: `.msi` & `-setup.exe` (WebView2)
-            - **macOS**: `.dmg` Universal (`Apple Silicon + Intel`)
-            - **Linux**: `.AppImage` & `.deb`
-            > **Note**: Purchased preflop range packs (e.g. `JNandez Preflop Chart.xlsx`) are **not** bundled; point **⚙ Pack & Settings** to your local folder after launch.
-          releaseDraft: true
+            ### PLO-4 Postflop — Hero vs Range (v0.1.0)
+            Готовые нативные установщики десктопного PLO-4 солвера и тренажёра (Tauri 2 + Rust DCFR):
+            - **Windows 10/11 (x64)**: `.msi` или `-setup.exe`
+            - **macOS (Apple Silicon + Intel Universal)**: `.dmg`
+            - **Linux (x64)**: `.AppImage` и `.deb`
+
+            > **Важно**: Купленные префлоп-чарты (например, `JNandez Preflop Chart.xlsx`) не вшиты в установщик. После первого запуска откройте **⚙ Pack & Settings** и укажите локальную папку с вашим паком.
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
 

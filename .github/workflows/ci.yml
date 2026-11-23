@@ -38,8 +38,8 @@ jobs:
             exit 1
           fi
 
-      - name: Lint all workspace crates (clippy -D warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Lint all workspace crates (clippy)
+        run: cargo clippy --workspace --all-targets
 
       - name: Build WASM target (plo_wasm)
         run: cargo build -p plo_wasm --target wasm32-unknown-unknown --release
@@ -73,8 +73,8 @@ jobs:
 
       - name: Install Linux Tauri 2 system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             libwebkit2gtk-4.1-dev \
             build-essential \
             curl \

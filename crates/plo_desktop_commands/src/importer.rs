@@ -639,10 +639,7 @@ fn is_spot_weight_header(hdr: &str) -> bool {
         "weighted",
         "δ",
     ];
-    if h == "Δ" || blocked_prefixes.iter().any(|p| lower.starts_with(p)) {
-        return false;
-    }
-    true
+    !(h == "Δ" || blocked_prefixes.iter().any(|p| lower.starts_with(p)))
 }
 
 fn expand_sheet_column_to_range(

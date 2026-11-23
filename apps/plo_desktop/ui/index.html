@@ -1,0 +1,798 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PLO-4 Postflop — Hero vs Range</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="gto-app">
+    <!-- TOP RIBBON / MENU BAR (GTO+ style) -->
+    <header class="gto-menubar">
+      <div class="gto-brand">
+        <span class="gto-logo">PLO+</span>
+        <span class="gto-title">PLO-4 Postflop</span>
+        <span id="pack-status-pill" class="gto-pack-pill">no pack</span>
+      </div>
+
+      <div class="gto-toolbar-btns">
+        <button id="btn-open-settings" class="gto-toolbtn" title="Range Pack Folder &amp; RAM Settings">⚙ Pack &amp; Settings</button>
+        <button id="btn-open-library" class="gto-toolbtn" title="Saved Spots Library, Binary .plotree Snapshots &amp; CSV/MD Export">📚 Library</button>
+        <button id="btn-open-hh" class="gto-toolbtn" title="Paste Hand History &amp; Full Hand EV Audit (#1)">📋 Paste HH</button>
+        <button id="btn-open-subset" class="gto-toolbtn" title="Multi-Flop C-Bet Subset Report">📊 Flop Subset</button>
+        <button id="btn-open-simplify" class="gto-toolbtn" title="Auto-Simplify Strategy / Pure-Size EV Optimizer (#3)">⚡ Bet Sizes</button>
+        <button id="btn-save-cfg" class="gto-toolbtn" title="Save Spot Config (.json)">💾 Save</button>
+        <button id="btn-load-cfg" class="gto-toolbtn" title="Load Spot Config (.json)">📂 Load</button>
+        <input id="file-load-cfg" type="file" accept=".json,application/json" hidden />
+      </div>
+
+      <div class="gto-toolbar-params">
+        <span id="lbl-threads-pill" class="gto-thread-pill" title="Native parallel solver threads">⚡ 1T</span>
+        <label class="gto-inline-param" title="Target DCFR iterations">
+          <span>Iters</span>
+          <input id="inp-iters" type="number" min="1" max="100000" step="50" value="1000" />
+        </label>
+        <label class="gto-inline-param" title="Auto-stop when Nash exploitability drops below Target dEV (% of starting pot). 0 = run all iterations.">
+          <span>Target dEV%</span>
+          <input id="inp-target-dev" type="number" min="0" max="50" step="0.1" value="0" style="width:52px" />
+        </label>
+        <label class="gto-inline-param" title="Desktop system RAM budget (MiB or GiB, e.g. 8192 or 16 GiB)">
+          <span>Budget</span>
+          <input id="inp-budget" type="text" value="8192" spellcheck="false" placeholder="16 GiB" />
+        </label>
+      </div>
+    </header>
+
+    <!-- GTO+ HORIZONTAL DECISION TREE NAVIGATOR BAR -->
+    <nav class="gto-tree-strip" aria-label="Decision tree path">
+      <div class="tree-strip-left">
+        <button id="btn-reset-cursor" class="tree-root-btn" disabled title="Return to tree root">⌂ Root</button>
+        <div id="history-breadcrumbs" class="gto-tree-nodes">
+          <span class="tree-node-box active">Root (Start)</span>
+        </div>
+      </div>
+      <div class="tree-strip-right">
+        <span id="lbl-subgame-badge" class="subgame-badge hidden" title="Currently inspecting an Exact Identity Subgame">⚡ Subgame</span>
+        <button id="btn-exit-subgame" class="gto-toolbtn hidden" type="button" title="Return from resolved subgame back to parent tree">↩ Parent Tree</button>
+        <button id="btn-resolve-subgame" class="gto-toolbtn hidden" type="button" title="Re-solve remaining Turn/River street with Exact Identity combos (0 bucket loss)">⚡ Exact Subgame</button>
+        <button id="btn-toggle-minimap" class="gto-toolbtn" type="button" title="Toggle interactive visual street tree minimap (Shortcut: M)">🗺 Tree Map</button>
+        <span id="lbl-locked-badge" class="locked-count-badge hidden" title="Number of locked decision nodes in tree">🔒 0 Locked</span>
+        <button id="btn-bot-toggle" class="gto-toolbtn" type="button" disabled title="Play full hand vs GTO Solver Bot with live runouts &amp; showdown (#2)">🤖 Play vs Bot</button>
+        <button id="btn-drill-toggle" class="gto-toolbtn" type="button" title="Interactive GTO Trainer: hides Hero frequencies until you pick an action (Keys 1-5)">🎯 Drill Mode</button>
+        <button id="btn-open-lock" class="gto-toolbtn" type="button" disabled title="Lock uniform or per-Hand-Class frequencies at this node">🔒 Lock Node</button>
+        <button id="btn-copy-report" class="gto-toolbtn" type="button" disabled title="Copy current node Markdown report to clipboard">📋 Export</button>
+        <button id="btn-step-more" class="gto-toolbtn" disabled title="Run +250 extra DCFR iterations">+250 Iters</button>
+      </div>
+    </nav>
+
+    <!-- INTERACTIVE STREET TREE MINIMAP (#7) -->
+    <div id="street-minimap-bar" class="street-minimap-bar hidden" aria-label="Street decision tree minimap">
+      <div class="minimap-title">Street Tree:</div>
+      <div id="street-minimap-nodes" class="minimap-nodes-flow"></div>
+      <div class="minimap-shortcuts-hint">Keys: <code>1–5</code> Act · <code>⌫/←</code> Back · <code>R</code> Root · <code>F</code> Filter</div>
+    </div>
+
+    <!-- MAIN 3-PANE GTO+ WORKSPACE -->
+    <main class="gto-workspace">
+      <!-- LEFT DOCK: TREE & RANGE BUILDER -->
+      <aside class="gto-pane gto-left-dock">
+        <div class="pane-titlebar">
+          <span>1. Spot &amp; Range Setup</span>
+          <span id="lbl-board-street" class="street-chip">RIVER</span>
+        </div>
+
+        <!-- BOARD SECTION -->
+        <div class="dock-section">
+          <div class="sec-row">
+            <span class="sec-label">Board (3 / 4 / 5 cards)</span>
+            <button id="btn-open-board-picker" class="picker-btn" type="button">🃏 Pick Cards</button>
+          </div>
+          <div class="cards-slot-row" id="left-board-slots"></div>
+          <input id="inp-board" type="text" value="KsQsJs7d2c" spellcheck="false" placeholder="e.g. KsQsJs7d2c" class="mono-input mt-4" />
+        </div>
+
+        <!-- HERO 4 CARDS + SEAT -->
+        <div class="dock-section">
+          <div class="sec-row">
+            <span class="sec-label">Hero Hand (Exact 4 Cards)</span>
+            <button id="btn-open-hero-picker" class="picker-btn" type="button">🃏 Pick 4</button>
+          </div>
+          <div class="hero-visual-row">
+            <div class="cards-slot-row" id="hero-cards-mini"></div>
+            <div class="seat-switch" role="radiogroup" aria-label="Hero seat">
+              <label class="seat-opt seat-oop" title="Hero acts first Out of Position">
+                <input type="radio" name="hero-seat" value="OOP" />
+                <span>OOP</span>
+              </label>
+              <label class="seat-opt seat-ip" title="Hero acts last In Position">
+                <input type="radio" name="hero-seat" value="IP" checked />
+                <span>IP</span>
+              </label>
+            </div>
+          </div>
+          <input id="inp-hero" type="text" value="KdQd4c3c" spellcheck="false" placeholder="e.g. AsKsQhJh" class="mono-input mt-4" />
+        </div>
+
+        <!-- VILLAIN SPOT / RANGE -->
+        <div class="dock-section">
+          <div class="sec-row">
+            <span class="sec-label">Villain Preflop Line</span>
+            <label class="pack-chk">
+              <input id="chk-use-pack" type="checkbox" checked />
+              <span>Use Nandez Pack</span>
+            </label>
+          </div>
+
+          <div id="pack-spot-box">
+            <select id="sel-villain-spot" class="spot-select"></select>
+          </div>
+
+          <div id="override-range-box" class="hidden">
+            <textarea id="inp-villain-override" rows="2" spellcheck="false" placeholder="AsTs4h3h, Ah9s6d5d or AAKK$ds">AsTs4h3h, Ah9s6d5d</textarea>
+          </div>
+
+          <div class="blocker-bar">
+            <span id="villain-counts-text">Villain — combos</span>
+            <button id="btn-refresh-preview" class="icon-refresh" title="Recalculate dead-card blockers">↻</button>
+          </div>
+        </div>
+
+        <!-- POT / STACK / GTO+ STREET BET SIZES (FLOP · TURN · RIVER) / ABSTRACTION -->
+        <div class="dock-section">
+          <div class="sec-head">
+            <span class="sec-label">Pot-Limit Tree &amp; Street Sizes</span>
+            <button id="btn-copy-flop-all" type="button" class="mini-card-btn" title="Copy active street OOP/IP sizes to Flop, Turn &amp; River">⇄ Sync Streets</button>
+          </div>
+          <div class="pot-stack-grid">
+            <label class="pfield">
+              <span>Starting Pot</span>
+              <input id="inp-pot" type="number" min="1" step="1" value="100" />
+            </label>
+            <label class="pfield">
+              <span>Eff. Stack</span>
+              <input id="inp-stack" type="number" min="1" step="1" value="100" />
+            </label>
+            <div class="pfield">
+              <span>SPR</span>
+              <div id="lbl-spr" class="spr-readout">1.00</div>
+            </div>
+          </div>
+
+          <!-- SOLVE STREETS SCOPE SELECTOR (ALL TOGETHER / FLOP ONLY / TURN ONLY / RIVER ONLY) -->
+          <div class="solve-scope-box mt-5">
+            <div class="solve-scope-hdr">
+              <span>Streets to Solve</span>
+              <span id="lbl-scope-hint" class="scope-hint">All remaining streets</span>
+            </div>
+            <div class="solve-scope-seg" role="radiogroup" aria-label="Streets to solve">
+              <button type="button" class="scope-btn active" data-scope="All" title="Solve all streets from the current board through River">All Streets</button>
+              <button type="button" class="scope-btn" data-scope="FlopOnly" title="Solve Flop betting only (Turn &amp; River check down to exact 2+3 showdown)">Flop Only</button>
+              <button type="button" class="scope-btn" data-scope="TurnOnly" title="Solve Turn betting only (River checks down to exact 2+3 showdown; needs ≥4 board cards)">Turn Only</button>
+              <button type="button" class="scope-btn" data-scope="RiverOnly" title="Solve River betting only (needs 5 board cards)">River Only</button>
+            </div>
+          </div>
+
+          <!-- GTO+ FLOP / TURN / RIVER BETTING MATRIX -->
+          <div class="street-sizes-box mt-5">
+            <div class="street-tabs" role="tablist">
+              <button type="button" id="tab-sz-flop" class="street-tab" data-street="flop">Flop</button>
+              <button type="button" id="tab-sz-turn" class="street-tab" data-street="turn">Turn</button>
+              <button type="button" id="tab-sz-river" class="street-tab active" data-street="river">River</button>
+            </div>
+
+            <div class="street-presets-row">
+              <span class="preset-lbl">Quick PLO:</span>
+              <button type="button" class="sz-preset-btn" data-preset="pot" title="100% Pot only (classic PLO)">Pot (100%)</button>
+              <button type="button" class="sz-preset-btn" data-preset="half-pot" title="50%, 100% Bet / 100% Raise">50, 100%</button>
+              <button type="button" class="sz-preset-btn" data-preset="two-size" title="33%, 75% Flop/Turn, 50%, 100% River">33, 75%</button>
+            </div>
+
+            <!-- FLOP PANEL -->
+            <div id="panel-sz-flop" class="street-sz-panel hidden">
+              <div class="sz-matrix-hdr">
+                <span>Seat</span><span>Bet % Pot</span><span>Raise % Pot</span>
+              </div>
+              <div class="sz-matrix-row">
+                <span class="sz-seat-tag oop">OOP</span>
+                <input id="inp-flop-oop-bets" type="text" value="33%, 75%" spellcheck="false" placeholder="33%, 75%" />
+                <input id="inp-flop-oop-raises" type="text" value="100%" spellcheck="false" placeholder="100%" />
+              </div>
+              <div class="sz-matrix-row">
+                <span class="sz-seat-tag ip">IP</span>
+                <input id="inp-flop-ip-bets" type="text" value="33%, 75%" spellcheck="false" placeholder="33%, 75%" />
+                <input id="inp-flop-ip-raises" type="text" value="100%" spellcheck="false" placeholder="100%" />
+              </div>
+            </div>
+
+            <!-- TURN PANEL -->
+            <div id="panel-sz-turn" class="street-sz-panel hidden">
+              <div class="sz-matrix-hdr">
+                <span>Seat</span><span>Bet % Pot</span><span>Raise % Pot</span>
+              </div>
+              <div class="sz-matrix-row">
+                <span class="sz-seat-tag oop">OOP</span>
+                <input id="inp-turn-oop-bets" type="text" value="50%, 100%" spellcheck="false" placeholder="50%, 100%" />
+                <input id="inp-turn-oop-raises" type="text" value="100%" spellcheck="false" placeholder="100%" />
+              </div>
+              <div class="sz-matrix-row">
+                <span class="sz-seat-tag ip">IP</span>
+                <input id="inp-turn-ip-bets" type="text" value="50%, 100%" spellcheck="false" placeholder="50%, 100%" />
+                <input id="inp-turn-ip-raises" type="text" value="100%" spellcheck="false" placeholder="100%" />
+              </div>
+              <div class="sz-donk-row">
+                <span class="sz-donk-lbl" title="OOP lead size on Turn after check-calling Flop (leave empty to use OOP Bet %)">OOP Donk %</span>
+                <input id="inp-turn-oop-donks" type="text" value="" spellcheck="false" placeholder="Same as OOP Bet (or e.g. 33%)" />
+              </div>
+            </div>
+
+            <!-- RIVER PANEL -->
+            <div id="panel-sz-river" class="street-sz-panel">
+              <div class="sz-matrix-hdr">
+                <span>Seat</span><span>Bet % Pot</span><span>Raise % Pot</span>
+              </div>
+              <div class="sz-matrix-row">
+                <span class="sz-seat-tag oop">OOP</span>
+                <input id="inp-river-oop-bets" type="text" value="50%, 100%" spellcheck="false" placeholder="50%, 100%" />
+                <input id="inp-river-oop-raises" type="text" value="100%" spellcheck="false" placeholder="100%" />
+              </div>
+              <div class="sz-matrix-row">
+                <span class="sz-seat-tag ip">IP</span>
+                <input id="inp-river-ip-bets" type="text" value="50%, 100%" spellcheck="false" placeholder="50%, 100%" />
+                <input id="inp-river-ip-raises" type="text" value="100%" spellcheck="false" placeholder="100%" />
+              </div>
+              <div class="sz-donk-row">
+                <span class="sz-donk-lbl" title="OOP lead size on River after check-calling Turn (leave empty to use OOP Bet %)">OOP Donk %</span>
+                <input id="inp-river-oop-donks" type="text" value="" spellcheck="false" placeholder="Same as OOP Bet (or e.g. 50%, 100%)" />
+              </div>
+            </div>
+
+            <!-- Compact 3-street overview pill bar so all 3 streets are visible at a glance -->
+            <div id="lbl-streets-overview" class="streets-overview-bar">
+              <span><b>F:</b> 33,75%</span>
+              <span><b>T:</b> 50,100%</span>
+              <span><b>R:</b> 50,100%</span>
+            </div>
+          </div>
+
+          <div class="rake-grid mt-5">
+            <label class="pfield" title="Showdown pot rake percentage (0 = zero-sum no rake; e.g. 5 = 5% pot rake)">
+              <span>Rake %</span>
+              <input id="inp-rake-pct" type="number" min="0" max="50" step="0.25" value="0" />
+            </label>
+            <label class="pfield" title="Maximum rake cap in chip units (0 = uncapped when Rake % > 0)">
+              <span>Rake Cap</span>
+              <input id="inp-rake-cap" type="number" min="0" step="0.5" value="0" />
+            </label>
+          </div>
+
+          <label class="pfield mt-5">
+            <span>Bucket Abstraction</span>
+            <select id="sel-abstraction">
+              <option value="Auto" selected>Auto (River exact · Turn/Flop smart)</option>
+              <option value="Identity">Identity (Exact combos)</option>
+              <option value="NutBlocker50">NutBlocker k=50 (25×2)</option>
+              <option value="NutBlocker100">NutBlocker k=100 (50×2)</option>
+            </select>
+          </label>
+        </div>
+
+        <!-- GTO+ RUN SOLVER CONTROLS -->
+        <div class="dock-section solver-run-box">
+          <div class="run-btn-grid">
+            <button id="btn-estimate" class="gto-btn gto-btn-neutral">Estimate</button>
+            <button id="btn-equity" class="gto-btn gto-btn-equity">Equity</button>
+            <button id="btn-solve" class="gto-btn gto-btn-solve">▶ Run Solver</button>
+            <button id="btn-stop" class="gto-btn gto-btn-stop" disabled>■ Stop</button>
+          </div>
+
+          <div class="solve-meter-track">
+            <div id="solve-progress-fill" class="solve-meter-fill" style="width:0%"></div>
+          </div>
+
+          <div class="solver-stats-grid">
+            <div class="srow"><span>Iterations:</span><strong id="st-iters">0</strong></div>
+            <div class="srow"><span>Speed:</span><strong id="st-speed">—</strong></div>
+            <div class="srow"><span>dEV (Exploit):</span><strong id="st-expl">—</strong></div>
+            <div class="srow"><span>Hero EV:</span><strong id="st-ev-hero">—</strong></div>
+            <div class="srow srow-full"><span>Memory:</span><strong id="st-ram">Est. — / Budget —</strong></div>
+          </div>
+
+          <!-- LIVE DCFR CONVERGENCE CHART (#4) -->
+          <div id="conv-chart-wrap" class="conv-chart-box hidden">
+            <div class="conv-chart-hdr">
+              <span>📈 Convergence (dEV % Pot)</span>
+              <span id="lbl-conv-last">—</span>
+            </div>
+            <svg id="svg-conv-chart" viewBox="0 0 260 64" preserveAspectRatio="none" class="conv-svg"></svg>
+          </div>
+        </div>
+      </aside>
+
+      <!-- CENTER STAGE: POKER TABLE + GTO+ ACTION TILES + HERO STRATEGY -->
+      <section class="gto-pane gto-center-stage">
+        <div class="pane-titlebar">
+          <span>2. Table &amp; Decision Node</span>
+          <div class="node-header-tags">
+            <span id="lbl-node-street" class="street-chip">RIVER</span>
+            <span id="node-badge" class="turn-badge">READY</span>
+          </div>
+        </div>
+
+        <div id="alert-box" class="gto-alert gto-alert-err hidden"></div>
+        <div id="warnings-box" class="gto-alert gto-alert-warn hidden"></div>
+
+        <!-- GTO+ FELT TABLE VISUAL -->
+        <div class="gto-table-arena">
+          <div class="felt-oval">
+            <!-- OOP Seat Box -->
+            <div id="seat-card-oop" class="table-seat seat-pos-oop">
+              <div class="seat-tag tag-oop">OOP</div>
+              <div id="seat-desc-oop" class="seat-role">Villain</div>
+              <div class="seat-commit">Commit: <strong id="lbl-commit-oop">0</strong></div>
+            </div>
+
+            <!-- Center Board & Pot -->
+            <div class="table-center-pot">
+              <div class="pot-pill">POT: <strong id="lbl-node-pot">100</strong> <span id="lbl-node-committed" class="commit-pair">[0, 0]</span></div>
+              <div id="board-cards-render" class="felt-board-cards"></div>
+            </div>
+
+            <!-- IP Seat Box -->
+            <div id="seat-card-ip" class="table-seat seat-pos-ip">
+              <div class="seat-tag tag-ip">IP · BTN</div>
+              <div id="seat-desc-ip" class="seat-role">Hero</div>
+              <div class="seat-commit">Commit: <strong id="lbl-commit-ip">0</strong></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- KPI METRICS BAR -->
+        <div class="gto-kpi-bar">
+          <div class="gkpi">
+            <span class="gkpi-lbl">Hero Root EV</span>
+            <span id="kpi-hero-ev" class="gkpi-val val-hi">—</span>
+          </div>
+          <div class="gkpi">
+            <span class="gkpi-lbl">Current Node EV</span>
+            <span id="kpi-node-ev" class="gkpi-val">—</span>
+          </div>
+          <div class="gkpi">
+            <span class="gkpi-lbl">Villain Root EV</span>
+            <span id="kpi-villain-ev" class="gkpi-val val-dim">—</span>
+          </div>
+          <div id="equity-line-cell" class="gkpi">
+            <span class="gkpi-lbl">Exact 2+3 Equity</span>
+            <span id="kpi-equity" class="gkpi-val val-eq">—</span>
+          </div>
+        </div>
+
+        <!-- NODE LOCKING INLINE DRAWER (#2 Uniform & #6 Per-Hand-Class) -->
+        <div id="node-lock-panel" class="gto-actions-panel node-lock-drawer hidden">
+          <div class="panel-subhdr">
+            <div class="lock-mode-tabs">
+              <span>🔒 Lock Node:</span>
+              <button id="tab-lock-uniform" class="view-tab-btn active" type="button">Uniform</button>
+              <button id="tab-lock-classes" class="view-tab-btn" type="button">By Hand Class</button>
+            </div>
+            <div class="lock-hdr-btns">
+              <button id="btn-unlock-this" class="mini-card-btn" type="button">Unlock This</button>
+              <button id="btn-unlock-all" class="mini-card-btn" type="button">Unlock All</button>
+              <button id="btn-close-lock" class="mini-card-btn" type="button">✕</button>
+            </div>
+          </div>
+          <div id="node-lock-sliders" class="lock-sliders-list"></div>
+          <div id="node-lock-classes-wrap" class="lock-classes-wrap hidden">
+            <div class="modal-note mb-4">Override action % for selected PLO classes (unchecked classes keep their solved GTO frequencies):</div>
+            <div id="node-lock-classes-list" class="lock-classes-list"></div>
+          </div>
+          <div class="lock-footer-row">
+            <label class="gto-inline-param">
+              <span>Re-solve Iters</span>
+              <input id="inp-lock-iters" type="number" min="0" max="10000" step="50" value="250" style="width:62px" />
+            </label>
+            <button id="btn-apply-lock" class="gto-btn gto-btn-solve" type="button">🔒 Apply Lock &amp; Re-Solve</button>
+          </div>
+        </div>
+
+        <!-- PLAY VS SOLVER BOT BANNER (#2 Phase-3) -->
+        <div id="bot-banner" class="gto-actions-panel bot-panel hidden">
+          <div class="panel-subhdr">
+            <span>🤖 Play vs GTO Solver Bot</span>
+            <div class="drill-stats-strip">
+              <button id="btn-bot-deal" class="gto-btn gto-btn-solve" type="button">🃏 Deal New Hand</button>
+              <button id="btn-bot-exit" class="mini-card-btn" type="button">✕ Exit Bot</button>
+            </div>
+          </div>
+          <div id="bot-events-log" class="bot-events-log">Bot ready — click an action tile below to play out the hand!</div>
+          <div id="bot-showdown-box" class="bot-showdown-box hidden"></div>
+        </div>
+
+        <!-- DRILL MODE FEEDBACK BANNER (#6) -->
+        <div id="drill-banner" class="gto-actions-panel drill-panel hidden">
+          <div class="panel-subhdr">
+            <span>🎯 GTO Drill Trainer</span>
+            <div class="drill-stats-strip">
+              <span id="lbl-drill-score">Hands: 0 · Avg EV Loss: 0.00</span>
+              <button id="btn-drill-reset" class="mini-card-btn" type="button">Reset Stats</button>
+            </div>
+          </div>
+          <div id="drill-feedback" class="drill-feedback-msg">
+            Frequencies hidden when Hero acts — pick the action you would play in-game!
+          </div>
+        </div>
+
+        <!-- GTO+ COLOR-CODED ACTION DECISION CARDS (Click to navigate tree) -->
+        <div id="tree-actions-box" class="gto-actions-panel hidden">
+          <div class="panel-subhdr">
+            <span id="lbl-step-prompt">Click an action to step down the decision tree:</span>
+          </div>
+          <div id="tree-action-buttons" class="gto-action-tiles"></div>
+        </div>
+
+        <!-- CHANCE RUNOUT 4x13 SUIT-RANK MATRIX WITH EV HEATMAP (#3) -->
+        <div id="tree-chance-box" class="gto-actions-panel hidden">
+          <div class="panel-subhdr">
+            <span>Chance Node — 4×13 Runout EV Heatmap:</span>
+            <label class="heatmap-toggle-lbl">
+              <input id="chk-runout-heatmap" type="checkbox" checked />
+              <span>Color by Hero EV</span>
+            </label>
+          </div>
+          <div id="tree-chance-buttons" class="gto-runout-grid"></div>
+          <div id="runout-hover-info" class="runout-hover-bar">Hover any card to inspect Hero EV (% pot) &amp; next-street frequencies.</div>
+        </div>
+
+        <!-- HERO EXACT 4-CARD STRATEGY BREAKDOWN (GTO+ Stacked Bar + Action Table) -->
+        <div class="gto-hero-panel">
+          <div class="panel-subhdr">
+            <span>Hero Hand Strategy at Current Node</span>
+            <div class="hero-hand-inline">
+              <span id="lbl-hero-class" class="hero-class-pill hidden">—</span>
+              <span id="lbl-hero-combo" class="mono-code">KdQd4c3c</span>
+              <span id="hero-center-cards" class="inline-mini-cards"></span>
+            </div>
+          </div>
+
+          <!-- Horizontal GTO+ Stacked Strategy Bar -->
+          <div id="hero-stacked-bar" class="gto-stacked-bar hidden"></div>
+
+          <div id="hero-strategy-empty" class="gto-empty-box">
+            Press <strong>▶ Run Solver</strong> to compute equilibrium strategy, or click <strong>Equity</strong> for instant exact 2+3 showdown equity.
+          </div>
+
+          <table id="hero-strategy-table" class="gto-table hero-freq-table hidden">
+            <thead>
+              <tr>
+                <th>Action</th>
+                <th>GTO+ Distribution</th>
+                <th class="num">Freq %</th>
+              </tr>
+            </thead>
+            <tbody id="hero-strategy-tbody"></tbody>
+          </table>
+
+          <!-- HERO SUIT & NUT-OUT MATRIX (#6 Phase-3) -->
+          <div id="hero-nut-outs-box" class="hero-nut-outs-box hidden">
+            <div class="nut-outs-hdr">
+              <span>🧬 Hero Suit &amp; Nut-Out Matrix</span>
+              <span id="lbl-hero-suit-struct" class="street-chip">—</span>
+            </div>
+            <div id="hero-nut-outs-body" class="nut-outs-rows"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- RIGHT PANE: VILLAIN RANGE / BUCKET BREAKDOWN (GTO+ Color-Stacked Rows, max 30 + N more) -->
+      <aside class="gto-pane gto-right-detail">
+        <div class="pane-titlebar">
+          <span id="lbl-detail-title">3. Villain Breakdown</span>
+          <div class="right-view-tabs">
+            <button type="button" id="tab-view-classes" class="view-tab-btn active" title="PLO-4 15-Category Made Hand &amp; Draw Breakdown">Classes</button>
+            <button type="button" id="tab-view-combos" class="view-tab-btn" title="Individual Live Combos / Buckets (up to 30)">Combos</button>
+            <button type="button" id="tab-view-blockers" class="view-tab-btn" title="52-Card Blocker Impact Matrix on Villain's Value / Draws / Air (#4)">Blockers</button>
+            <button type="button" id="tab-view-eqgraph" class="view-tab-btn" title="Villain EV / Equity Quintiles Distribution (#4)">Eq%</button>
+          </div>
+        </div>
+
+        <!-- PPT / MONKER VILLAIN RANGE FILTER BAR (#5) -->
+        <div class="villain-filter-bar">
+          <input id="inp-villain-filter" type="text" placeholder="Filter: AA, $ds, As, nfd, wrap, set, flush…" spellcheck="false" />
+          <button id="btn-clear-vfilter" class="mini-card-btn hidden" type="button" title="Clear filter">✕</button>
+          <span id="lbl-vfilter-count" class="vfilter-badge">—</span>
+        </div>
+
+        <div class="villain-quick-chips">
+          <button type="button" class="vchip" data-q="AA">AA</button>
+          <button type="button" class="vchip" data-q="$ds">$ds</button>
+          <button type="button" class="vchip" data-q="nfd">NFD</button>
+          <button type="button" class="vchip" data-q="wrap">Wrap</button>
+          <button type="button" class="vchip" data-q="set">Set+</button>
+          <button type="button" class="vchip" data-q="nutblk">NutBlk</button>
+        </div>
+
+        <!-- Villain Aggregate GTO+ Bar when Villain acts -->
+        <div id="villain-agg-wrap" class="villain-overall-box hidden">
+          <div class="panel-subhdr">
+            <span>Villain Overall Frequencies</span>
+            <span id="lbl-detail-mode" class="street-chip">—</span>
+          </div>
+          <div id="villain-stacked-bar" class="gto-stacked-bar mb-5"></div>
+          <div id="villain-agg-bars" class="villain-legend-list"></div>
+        </div>
+
+        <!-- PLO-4 HAND CLASS BREAKDOWN PANEL (#1) -->
+        <div id="villain-classes-container" class="gto-detail-scroll">
+          <div id="classes-empty" class="gto-empty-box">
+            Solve a spot to inspect Villain's 2+3 PLO Made Hands &amp; Draws (`Flush`, `Set`, `Wrap`, `Nut FD`, `Bare Nut Blocker`, …).
+          </div>
+          <div id="villain-classes-list" class="plo-class-rows hidden"></div>
+        </div>
+
+        <div id="detail-table-container" class="gto-detail-scroll hidden">
+          <div id="detail-empty" class="gto-empty-box">
+            Live Villain combos / buckets (top 30 by reach) with color-coded action bars appear here.
+          </div>
+          <table id="villain-detail-table" class="gto-table detail-freq-table hidden">
+            <thead id="villain-detail-thead"></thead>
+            <tbody id="villain-detail-tbody"></tbody>
+          </table>
+          <div id="villain-detail-more" class="gto-more-bar hidden"></div>
+        </div>
+
+        <!-- 52-CARD BLOCKER IMPACT MATRIX (#4a) -->
+        <div id="villain-blockers-container" class="gto-detail-scroll hidden">
+          <div class="panel-subhdr mb-4">
+            <span>52-Card Blocker Impact on Villain</span>
+            <select id="sel-blocker-metric" class="compact-sel">
+              <option value="value">Blocks Value %</option>
+              <option value="total">Blocks Total %</option>
+              <option value="air">Blocks Air %</option>
+            </select>
+          </div>
+          <div id="blocker-52-matrix" class="gto-runout-grid"></div>
+          <div id="blocker-hover-info" class="runout-hover-bar">Hover any card (★ = in Hero hand) to see how much Value / Draws / Air it blocks.</div>
+        </div>
+
+        <!-- EQUITY / EV QUINTILES DISTRIBUTION GRAPH (#4b) -->
+        <div id="villain-eqgraph-container" class="gto-detail-scroll hidden">
+          <div id="eqgraph-empty" class="gto-empty-box">Solve a spot to inspect Villain's 5-Quintile Equity / EV polarization graph.</div>
+          <div id="villain-eqgraph-list" class="plo-class-rows hidden"></div>
+        </div>
+      </aside>
+    </main>
+
+    <!-- COMPACT SINGLE-LINE STATUS BAR + "?" POPOVER -->
+    <footer class="gto-statusbar">
+      <span>Hero combo vs villain spot · not range vs range</span>
+      <div class="popover-anchor">
+        <button id="btn-footer-help" class="help-q" type="button" aria-label="Solver info" title="Technical &amp; Legal Info">?</button>
+        <div id="footer-popover" class="footer-popover hidden">
+          <div id="mandatory-footer">
+            Hero one combo vs villain range. Not BTN-range vs BB-range. Buckets share strategy; showdown is exact 2+3. NutBlocker disables suit iso. 512 MiB was the WASM/browser cap — Desktop uses system RAM (always estimated before build; wide flop trees are still compute-bound by the 41×40 chance tree). Purchased range pack is not included in the app.
+          </div>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <!-- 52-CARD GRAPHICAL PICKER MODAL (Board 3–5 Cards or Hero 4 Cards) -->
+  <div id="card-picker-modal" class="modal-backdrop hidden">
+    <div class="modal-card picker-modal-card">
+      <div class="modal-header">
+        <span id="picker-modal-title">Select Cards</span>
+        <button id="btn-close-picker" class="gto-toolbtn" type="button">✕ Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="picker-top-strip">
+          <div id="picker-selected-preview" class="cards-slot-row"></div>
+          <div class="picker-top-btns">
+            <button id="btn-picker-clear" class="gto-toolbtn" type="button">Clear</button>
+            <button id="btn-picker-apply" class="gto-btn gto-btn-solve" type="button">Apply Cards</button>
+          </div>
+        </div>
+        <div id="picker-52-grid" class="deck-52-grid"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SETTINGS MODAL: Range Pack Folder, System RAM Budget & Custom Bindings -->
+  <div id="settings-modal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <span>Range Pack Folder &amp; Desktop RAM Settings</span>
+        <button id="btn-close-settings" class="gto-toolbtn" type="button">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-note">
+          Point to your local purchased range pack folder (<code>JNandez Preflop Chart.xlsx</code> or <code>.txt/.plo/.csv</code>). Read locally in-place; never bundled or uploaded.
+        </div>
+        <div class="folder-row">
+          <input id="inp-pack-folder" type="text" placeholder="C:\Ranges\NandezPack or .local/nandez_pack" spellcheck="false" />
+          <button id="btn-browse-folder" class="gto-toolbtn" type="button">Browse…</button>
+          <button id="btn-load-folder" class="gto-btn gto-btn-solve" type="button">Load Pack</button>
+        </div>
+
+        <div class="bind-block">
+          <div class="sec-row mb-4">
+            <span class="sec-label">Desktop RAM Budget (MiB or GiB, e.g. 8192 or 16 GiB)</span>
+            <span id="lbl-sys-ram" class="street-chip"></span>
+          </div>
+          <div class="folder-row">
+            <input id="inp-settings-budget" type="text" placeholder="e.g. 16384 or 16 GiB" spellcheck="false" />
+            <button id="btn-save-budget" class="gto-toolbtn" type="button">Save Budget</button>
+          </div>
+        </div>
+
+        <div class="bind-block">
+          <div class="sec-label mb-4">Custom Spot Binding Override (Optional)</div>
+          <div class="folder-row">
+            <input id="inp-bind-spot-id" type="text" placeholder="Spot ID (e.g. RFI_BTN)" spellcheck="false" />
+            <select id="sel-bind-source"></select>
+            <button id="btn-apply-bind" class="gto-toolbtn" type="button">Bind</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SAVED SPOTS LIBRARY & NODE EXPORT MODAL (#2) -->
+  <div id="library-modal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <span>📚 Saved Spots Library &amp; Node Export</span>
+        <button id="btn-close-library" class="gto-toolbtn" type="button">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-note">Bookmark current spot configuration &amp; summary EV in your local library, or export the active node to CSV / Markdown.</div>
+        <div class="folder-row">
+          <input id="inp-bm-folder" type="text" value="SRP / General" placeholder="Folder (e.g. BTN vs BB)" style="max-width:150px" />
+          <input id="inp-bm-name" type="text" placeholder="Bookmark name (optional — auto-named if empty)" />
+          <button id="btn-save-bookmark" class="gto-btn gto-btn-solve" type="button">★ Bookmark Spot</button>
+        </div>
+        <div class="folder-row">
+          <button id="btn-export-csv" class="gto-toolbtn" type="button">⬇ Download Node CSV</button>
+          <button id="btn-export-md" class="gto-toolbtn" type="button">📋 Copy Node Markdown</button>
+          <span id="lbl-export-status" class="street-chip"></span>
+        </div>
+        <!-- BINARY .PLOTREE SOLVED SNAPSHOTS (#5 Phase-3) -->
+        <div class="bind-block">
+          <div class="sec-label mb-4">💿 Solved Binary Tree Snapshot (<code>.plotree</code> — Instant Reload, 0 Re-Solve)</div>
+          <div class="folder-row">
+            <input id="inp-snapshot-path" type="text" value=".local/snapshots/spot.plotree" placeholder="Path to .plotree file" spellcheck="false" />
+            <button id="btn-save-snapshot" class="gto-btn gto-btn-solve" type="button">💿 Save .plotree</button>
+            <button id="btn-load-snapshot" class="gto-toolbtn" type="button">📂 Load .plotree</button>
+          </div>
+          <div id="lbl-snapshot-status" class="modal-note hidden"></div>
+        </div>
+        <div id="saved-spots-list" class="saved-spots-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PASTE HAND HISTORY PARSER & FULL HAND EV AUDIT MODAL (#3 Phase-2 + #1 Phase-3) -->
+  <div id="hh-modal" class="modal-backdrop hidden">
+    <div class="modal-card picker-modal-card">
+      <div class="modal-header">
+        <span>📋 Paste PLO-4 Hand History &amp; Full Hand EV Audit</span>
+        <button id="btn-close-hh" class="gto-toolbtn" type="button">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-note">Paste a raw 4-card PLO hand history. Load a single street OR run a <strong>Full Hand EV Audit</strong> across Flop, Turn &amp; River to grade every Hero decision (`Optimal` / `Inaccuracy` / `Blunder`)!</div>
+        <textarea id="txt-hh-input" rows="8" class="mono-textarea" spellcheck="false" placeholder="PokerStars Hand #123456: Omaha Pot Limit ($0.50/$1.00 USD)&#10;Table 'Alpha' 6-max Seat #1 is the button&#10;Seat 1: Hero ($100 in chips)&#10;Seat 3: Villain ($100 in chips)&#10;...&#10;Dealt to Hero [As Ks Qh Jh]&#10;*** FLOP *** [Ts 9s 2d]"></textarea>
+        <div class="folder-row">
+          <label class="gto-inline-param">
+            <span>Target Street</span>
+            <select id="sel-hh-street">
+              <option value="final">Latest Street Reached</option>
+              <option value="flop">Start from Flop (3 cards)</option>
+            </select>
+          </label>
+          <label class="gto-inline-param" title="DCFR iterations per street during Full Hand EV Audit">
+            <span>Audit Iters</span>
+            <input id="inp-hh-audit-iters" type="number" min="25" max="500" step="25" value="100" style="width:58px" />
+          </label>
+          <button id="btn-load-sample-hh" class="gto-toolbtn" type="button">Sample HH</button>
+          <button id="btn-parse-apply-hh" class="gto-toolbtn" type="button">⚡ Load Spot</button>
+          <button id="btn-audit-hh" class="gto-btn gto-btn-solve" type="button">🔍 Full Hand EV Audit</button>
+        </div>
+        <div id="hh-parsed-summary" class="modal-note hidden"></div>
+        <div id="hh-audit-wrap" class="subset-table-wrap hidden">
+          <table class="gto-table">
+            <thead>
+              <tr>
+                <th>Street</th>
+                <th>Board</th>
+                <th>Hero Action</th>
+                <th class="num">GTO %</th>
+                <th>Best GTO</th>
+                <th class="num">ΔEV (Chips / bb)</th>
+                <th>Grade</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="hh-audit-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AUTO-SIMPLIFY STRATEGY / PURE-SIZE OPTIMIZER MODAL (#3 Phase-3) -->
+  <div id="simplify-modal" class="modal-backdrop hidden">
+    <div class="modal-card picker-modal-card">
+      <div class="modal-header">
+        <span>⚡ Auto-Simplify Strategy / Pure-Size Optimizer</span>
+        <button id="btn-close-simplify" class="gto-toolbtn" type="button">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-note">Benchmarks candidate single bet sizes against a Full Multi-Size (`33%, 67%, 100%`) tree on the current board street so you can pick ONE simplified sizing with near-100% GTO EV retention!</div>
+        <div class="folder-row">
+          <input id="inp-simplify-sizes" type="text" value="33% | 50% | 67% | 75% | 100%" spellcheck="false" placeholder="Pipe-separated candidate sizes, e.g. 33% | 50% | 75% | 100%" />
+          <label class="gto-inline-param">
+            <span>Iters/Size</span>
+            <input id="inp-simplify-iters" type="number" min="30" max="600" step="30" value="120" style="width:58px" />
+          </label>
+          <button id="btn-run-simplify" class="gto-btn gto-btn-solve" type="button">▶ Compare Bet Sizes</button>
+        </div>
+        <div id="simplify-status" class="modal-note">Ready — benchmarks single bet sizes for your current Hero Hand, Seat &amp; Board.</div>
+        <div class="subset-table-wrap">
+          <table id="simplify-results-table" class="gto-table hidden">
+            <thead>
+              <tr>
+                <th>Sizing Tree</th>
+                <th class="num">Hero Root EV</th>
+                <th class="num">ΔEV (% Pot)</th>
+                <th class="num">EV Retention</th>
+                <th>Root Strategy</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="simplify-results-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MULTI-FLOP SUBSET C-BET REPORT MODAL (#5) -->
+  <div id="subset-modal" class="modal-backdrop hidden">
+    <div class="modal-card picker-modal-card">
+      <div class="modal-header">
+        <span>📊 Multi-Flop C-Bet &amp; EV Subset Report</span>
+        <button id="btn-close-subset" class="gto-toolbtn" type="button">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-note">Runs rapid <code>FlopOnly</code> solves for your Hero 4-card hand vs Villain's range across representative PLO flop textures. Click any row to load &amp; solve that flop!</div>
+        <div class="folder-row">
+          <input id="inp-subset-flops" type="text" value="AsKs7d, KsQhJc, QsJs9s, JhTh6d, Ts9d8c, 9h9d4s, As7d2c, 7s6s5d" spellcheck="false" placeholder="Comma-separated 3-card flops" />
+          <label class="gto-inline-param">
+            <span>Iters/Flop</span>
+            <input id="inp-subset-iters" type="number" min="20" max="500" step="20" value="80" style="width:58px" />
+          </label>
+          <button id="btn-run-subset" class="gto-btn gto-btn-solve" type="button">▶ Run Subset</button>
+        </div>
+        <div id="subset-status" class="modal-note">Ready — uses your current Hero Hand, Seat, Villain Range, Pot &amp; Stack.</div>
+        <div class="subset-table-wrap">
+          <table id="subset-results-table" class="gto-table hidden">
+            <thead>
+              <tr>
+                <th>Flop</th>
+                <th>Texture</th>
+                <th>Hero Class</th>
+                <th class="num">Hero EV</th>
+                <th class="num">EV % Pot</th>
+                <th>Root Strategy</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="subset-results-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

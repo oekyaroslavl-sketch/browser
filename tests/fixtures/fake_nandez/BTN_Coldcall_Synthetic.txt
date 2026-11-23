@@ -1,0 +1,2 @@
+# Synthetic test fixture ONLY (invented hands, zero real pack data)
+AsKsQhJh@1.0, AdKdQcJc@1.0, AhKhQdJd@0.75, Ts9s8h7h@0.5, 9d8d7c6c@0.25

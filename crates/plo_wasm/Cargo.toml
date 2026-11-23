@@ -1,0 +1,17 @@
+[package]
+name = "plo_wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebAssembly bindings and memory-aware API for the PLO-4 postflop solver"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+plo_cards = { path = "../plo_cards" }
+plo_eval = { path = "../plo_eval" }
+plo_iso = { path = "../plo_iso" }
+plo_range = { path = "../plo_range" }
+plo_tree = { path = "../plo_tree" }
+plo_cfr = { path = "../plo_cfr" }

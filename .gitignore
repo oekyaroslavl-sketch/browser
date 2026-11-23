@@ -1,0 +1,15 @@
+# Build outputs
+/target/
+/pkg/
+/node_modules/
+*.wasm
+
+# Local & user purchased range packs & solved tree snapshots (NEVER commit real packs!)
+/.local/
+/google_drive/
+/nandez_pack/
+*Nandez*.xlsx
+*nandez*.xlsx
+*.plotree
+
+

@@ -1,0 +1,18 @@
+[package]
+name = "plo_desktop_commands"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless orchestration, Nandez OOXML/text range-pack importer, and UI bridge for PLO-4 Postflop — Hero vs Range"
+
+[dependencies]
+plo_cards = { path = "../plo_cards" }
+plo_eval = { path = "../plo_eval" }
+plo_iso = { path = "../plo_iso" }
+plo_range = { path = "../plo_range" }
+plo_tree = { path = "../plo_tree" }
+plo_cfr = { path = "../plo_cfr" }
+
+[[bin]]
+name = "plo_desktop_preview"
+path = "src/bin/plo_desktop_preview.rs"

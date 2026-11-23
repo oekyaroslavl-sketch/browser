@@ -1,0 +1,11 @@
+[package]
+name = "plo_range"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sparse weighted 4-card PLO ranges, pattern parser, blocker filtering, and exact equity engine"
+
+[dependencies]
+plo_cards = { path = "../plo_cards" }
+plo_eval = { path = "../plo_eval" }
+plo_iso = { path = "../plo_iso" }

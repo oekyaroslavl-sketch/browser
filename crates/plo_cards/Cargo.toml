@@ -1,0 +1,6 @@
+[package]
+name = "plo_cards"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PLO-4 card, sorted 4-card hand, board, bitmask, and C(52,4) ComboId representation"

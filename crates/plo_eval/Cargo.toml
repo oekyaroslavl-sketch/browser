@@ -1,0 +1,9 @@
+[package]
+name = "plo_eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Fast and exact 2-hole + 3-board Pot-Limit Omaha hand evaluator"
+
+[dependencies]
+plo_cards = { path = "../plo_cards" }

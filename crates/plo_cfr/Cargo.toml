@@ -1,0 +1,23 @@
+[package]
+name = "plo_cfr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Discounted CFR postflop solver for PLO-4 (River, Turn, Flop) with 4-card blocker inclusion-exclusion"
+
+[dependencies]
+plo_cards = { path = "../plo_cards" }
+plo_eval = { path = "../plo_eval" }
+plo_iso = { path = "../plo_iso" }
+plo_range = { path = "../plo_range" }
+plo_tree = { path = "../plo_tree" }
+
+[[test]]
+name = "golden"
+path = "../../tests/golden/golden_spots.rs"
+
+[[test]]
+name = "d2_river_raise_or_probe"
+path = "../../tests/golden/d2_river_raise_or_probe.rs"
+
+

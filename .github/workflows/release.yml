@@ -1,0 +1,208 @@
+name: Release Desktop Installers
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify-before-bundle:
+    name: Pre-Release Solver & Legal Hygiene Gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Ensure bundle.resources is empty & no range packs tracked
+        run: |
+          if git ls-files | grep -Ei '(nandez_pack|\.local/|JNandez.*\.xlsx|\.plotree$)'; then
+            echo "ERROR: Proprietary range pack or snapshot tracked in Git!"
+            exit 1
+          fi
+          python3 -c '
+          import json
+          cfg = json.load(open("apps/plo_desktop/src-tauri/tauri.conf.json"))
+          assert cfg.get("bundle", {}).get("resources") == [], "bundle.resources must remain []"
+          '
+
+      - name: Lint & run headless desktop verification (t1..t18)
+        run: |
+          if ! CARGO_TERM_COLOR=never cargo clippy --workspace --all-targets -- -D warnings > clippy.log 2>&1; then
+            ERR=$(grep -E '^error|-->' clippy.log | head -n 30 | tr '\n' ' ' | sed 's/::/ /g')
+            echo "::error title=ClippyFailed::$ERR"
+            cat clippy.log
+            exit 1
+          fi
+          cargo check -p plo_wasm --target wasm32-unknown-unknown
+          cargo test -p plo_desktop_commands --release
+
+  build-windows:
+    name: Build Windows x64 Installer (.msi & .exe)
+    needs: verify-before-bundle
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "apps/plo_desktop/src-tauri -> target"
+
+      - name: Install @tauri-apps/cli & build Windows installers
+        working-directory: apps/plo_desktop
+        shell: pwsh
+        run: |
+          npm install
+          npx tauri build *> build.log
+          if ($LASTEXITCODE -ne 0) {
+            $err = (Get-Content build.log -Tail 35) -join " | "
+            Write-Output "::error title=TauriWinBuildFailed::$err"
+            Get-Content build.log
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path dist-out | Out-Null
+          Get-ChildItem src-tauri/target/release/bundle -Recurse -File |
+            Where-Object { $_.Extension -in @('.msi', '.exe') } |
+            ForEach-Object { Copy-Item $_.FullName -Destination ./dist-out/ -Force }
+          Get-ChildItem dist-out | Format-Table Name, Length
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plo4-desktop-windows-x64
+          path: |
+            apps/plo_desktop/dist-out/*.msi
+            apps/plo_desktop/dist-out/*.exe
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS Universal Installer (.dmg)
+    needs: verify-before-bundle
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "apps/plo_desktop/src-tauri -> target"
+
+      - name: Install @tauri-apps/cli & build macOS Universal DMG
+        working-directory: apps/plo_desktop
+        run: |
+          npm install
+          npx tauri build --target universal-apple-darwin
+          mkdir -p dist-out
+          find src-tauri/target -type f -name "*.dmg" -exec cp {} dist-out/ \;
+          ls -lh dist-out/
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plo4-desktop-macos-universal
+          path: apps/plo_desktop/dist-out/*.dmg
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux x64 Package (.deb)
+    needs: verify-before-bundle
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install WebKit2GTK system headers
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            file
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "apps/plo_desktop/src-tauri -> target"
+
+      - name: Install @tauri-apps/cli & build Linux .deb
+        working-directory: apps/plo_desktop
+        run: |
+          npm install
+          if ! npx tauri build --bundles deb > build.log 2>&1; then
+            ERR=$(tail -n 35 build.log | tr '\n' ' ' | sed 's/::/ /g')
+            echo "::error title=TauriLinuxBuildFailed::$ERR"
+            cat build.log
+            exit 1
+          fi
+          mkdir -p dist-out
+          find src-tauri/target -type f -name "*.deb" -exec cp {} dist-out/ \;
+          ls -lh dist-out/
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plo4-desktop-linux-x64
+          path: apps/plo_desktop/dist-out/*.deb
+          if-no-files-found: error
+
+  publish-github-release:
+    name: Publish GitHub Release
+    needs: [build-windows, build-macos, build-linux]
+    if: always() && (needs.build-windows.result == 'success' || needs.build-macos.result == 'success' || needs.build-linux.result == 'success')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download built installers
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create or update GitHub Release with direct download links
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          TAG="v0.1.1"
+          if [[ "$REF_NAME" == v*.*.* ]]; then
+            TAG="$REF_NAME"
+          fi
+          ls -lh release-assets/
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber --repo "$REPO"
+          else
+            gh release create "$TAG" release-assets/* \
+              --repo "$REPO" \
+              --target "${{ github.sha }}" \
+              --title "PLO-4 Postflop — Hero vs Range $TAG" \
+              --notes "$(cat <<EOF
+          ### Скачать PLO-4 Postflop — Hero vs Range ($TAG)
+          Нативные десктопные установщики (Tauri 2 + Rust DCFR):
+          - **Windows 10/11 (x64)**: скачайте \`.exe\` (\`*-setup.exe\`) или \`.msi\`
+          - **macOS (Apple Silicon + Intel Universal)**: скачайте \`.dmg\`
+          - **Linux (Ubuntu/Debian x64)**: скачайте \`.deb\`
+
+          > **Примечание о префлоп-чартах**: Покупные префлоп-чарты (например, \`JNandez Preflop Chart.xlsx\`) не вшиты в установщик. После запуска нажмите **⚙ Pack & Settings** и укажите папку с вашим локальным паком.
+          >
+          > **Лицензия и исходный код (GNU AGPL-3.0-only)**: Полный соответствующий исходный код этого релиза доступен в репозитории \`$REPO\` по тегу \`$TAG\` (см. \`LICENSE\` и \`NOTICE\`). При распространении бинарных сборок или предоставлении сетевого доступа к модифицированной версии необходимо предоставлять полный исходный код на условиях GNU AGPL v3.
+          EOF
+          )"
+          fi

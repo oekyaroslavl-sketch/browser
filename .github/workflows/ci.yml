@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "arena/**"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-and-wasm-verify:
+    name: Rust Solver, WASM & Desktop Headless Suite
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + clippy + wasm32)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node.js 22 (UI syntax check)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Verify zero proprietary range packs in Git tree
+        run: |
+          if git ls-files | grep -Ei '(nandez_pack|\.local/|JNandez.*\.xlsx|\.plotree$)'; then
+            echo "ERROR: Proprietary range pack or .plotree artifact tracked in Git!"
+            exit 1
+          fi
+
+      - name: Lint all workspace crates (clippy -D warnings)
+        run: |
+          if ! CARGO_TERM_COLOR=never cargo clippy --workspace --all-targets -- -D warnings > clippy.log 2>&1; then
+            ERR=$(grep -E '^error|-->' clippy.log | head -n 30 | tr '\n' ' ' | sed 's/::/ /g')
+            echo "::error title=ClippyFailed::$ERR"
+            cat clippy.log
+            exit 1
+          fi
+
+      - name: Build WASM target (plo_wasm)
+        run: cargo build -p plo_wasm --target wasm32-unknown-unknown --release
+
+      - name: Validate Desktop UI JavaScript syntax
+        run: node --check apps/plo_desktop/ui/app.js
+
+      - name: Run unit tests & fast regression goldens (g1, g2, g3, g4, d1, d2)
+        run: |
+          cargo test -p plo_cards -p plo_eval -p plo_iso -p plo_range -p plo_tree --release
+          cargo test -p plo_cfr --lib --release
+          cargo test -p plo_cfr --test golden --release -- g1
+          cargo test -p plo_cfr --test golden --release -- g2
+          cargo test -p plo_cfr --test golden --release -- g3
+          cargo test -p plo_cfr --test golden --release -- g4
+          cargo test -p plo_cfr --test golden --release -- d1
+          cargo test -p plo_cfr --test d2_river_raise_or_probe --release
+
+      - name: Run Desktop headless integration suite (t1..t18)
+        run: cargo test -p plo_desktop_commands --release
+
+      - name: Build standalone Desktop Preview server binary
+        run: cargo build --release -p plo_desktop_commands --bin plo_desktop_preview
+
+  tauri-compile-check:
+    name: Tauri 2 Native Shell Compile Check (Linux WebKitGTK)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux Tauri 2 system dependencies
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "apps/plo_desktop/src-tauri -> target"
+
+      - name: Check Tauri 2 desktop binary compilation
+        working-directory: apps/plo_desktop/src-tauri
+        run: |
+          if ! cargo check > check.log 2>&1; then
+            ERR=$(tail -n 35 check.log | tr '\n' ' ' | sed 's/::/ /g')
+            echo "::error title=TauriCargoCheckFailed::$ERR"
+            cat check.log
+            exit 1
+          fi

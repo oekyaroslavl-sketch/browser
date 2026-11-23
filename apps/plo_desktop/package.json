@@ -1,0 +1,13 @@
+{
+  "name": "plo-desktop-app",
+  "private": true,
+  "version": "0.1.1",
+  "scripts": {
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.2.0"
+  }
+}

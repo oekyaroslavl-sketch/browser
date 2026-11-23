@@ -1,0 +1,9 @@
+[package]
+name = "plo_iso"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Suit isomorphism and canonicalization for 4-card PLO hands, boards, and chance runouts"
+
+[dependencies]
+plo_cards = { path = "../plo_cards" }

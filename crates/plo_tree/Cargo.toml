@@ -1,0 +1,9 @@
+[package]
+name = "plo_tree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pot-Limit Omaha postflop action tree builder (Flop, Turn, River)"
+
+[dependencies]
+plo_cards = { path = "../plo_cards" }

@@ -1,0 +1,24 @@
+[package]
+name = "plo_desktop"
+version = "0.1.1"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Tauri 2 Desktop Application for PLO-4 Postflop — Hero vs Range"
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+plo_desktop_commands = { path = "../../../crates/plo_desktop_commands" }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde_json = "1.0"
+
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+

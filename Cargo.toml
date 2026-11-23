@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/plo_cards",
+    "crates/plo_eval",
+    "crates/plo_iso",
+    "crates/plo_range",
+    "crates/plo_tree",
+    "crates/plo_cfr",
+    "crates/plo_wasm",
+    "crates/plo_desktop_commands",
+]
+exclude = [
+    "apps/plo_desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.1"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

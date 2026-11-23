@@ -1,0 +1,48 @@
+PLO-4 Postflop — Hero vs Range
+Copyright (C) 2026 PLO-4 Postflop Contributors (https://github.com/oekyaroslavl-sketch/browser)
+
+Licensed under the GNU Affero General Public License v3.0 or later (SPDX: AGPL-3.0-or-later).
+See the LICENSE file in the repository root for the full license text.
+
+================================================================================
+Architectural Inspiration, References & Clean-Room Notice
+================================================================================
+
+All Rust crates (`plo_cards`, `plo_eval`, `plo_iso`, `plo_range`, `plo_tree`, `plo_cfr`,
+`plo_wasm`, `plo_desktop_commands`) and the Tauri 2 / Web UI (`apps/plo_desktop`, `js/`)
+were implemented from scratch specifically for 4-card Pot-Limit Omaha (exact 2-hole + 3-board
+evaluation, 15-term 4-card inclusion-exclusion terminal counterfactual values, and 2D
+equity x nut-blocker postflop bucketing).
+
+We acknowledge the following open-source projects and academic publications whose public
+designs, algorithms, and license terms informed our architecture:
+
+1. `wasm-postflop` / `postflop-solver` by b-inary (`https://github.com/b-inary/wasm-postflop`
+   and `https://github.com/b-inary/postflop-solver`), distributed under GNU AGPL-3.0:
+   - Inspired the browser/WASM + Rust solver crate split and interactive postflop tree
+     navigation workflow (note: no Hold'em source code was copied; this repository implements
+     PLO-4 4-card combinatorics and 15-term inclusion-exclusion natively).
+   - Consistent with our AGPL-3.0-or-later license, any distribution of compiled binaries
+     (`.msi`, `.exe`, `.dmg`, `.deb`, `.wasm`) or network-accessible deployment must provide
+     access to the complete Corresponding Source under GNU AGPL v3.
+
+2. Discounted Counterfactual Regret Minimization (DCFR):
+   - Noam Brown & Tuomas Sandholm, "Solving Imperfect-Information Games via Discounted Regret
+     Minimization", AAAI 2019 (`arXiv:1809.04040`).
+
+3. Cactus Kev Prime-Product 5-Card Hand Evaluation:
+   - Kevin Suffecool ("Cactus Kev"), prime-product lookup technique for 5-card equivalence
+     classes (`7,462` distinct 5-card ranks), adapted here to PLO-4 mandatory 2-hole + 3-board
+     evaluation (`crates/plo_eval`).
+
+4. Tauri 2 Application Framework & Dialog Plugin (`https://tauri.app`):
+   - Copyright (c) Tauri Programme within The Commons Conservancy, licensed under Apache-2.0
+     or MIT (`apps/plo_desktop/src-tauri`).
+
+================================================================================
+Proprietary Preflop Range Packs Notice
+================================================================================
+
+This repository and its binary installers contain ZERO proprietary third-party preflop charts
+(`bundle.resources = []`). Users may optionally point the local importer (`crates/plo_desktop_commands`)
+at their own locally licensed `.xlsx` / `.txt` / `.plo` / `.csv` files on disk.

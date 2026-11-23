@@ -92,4 +92,10 @@ jobs:
 
       - name: Check Tauri 2 desktop binary compilation
         working-directory: apps/plo_desktop/src-tauri
-        run: cargo check
+        run: |
+          if ! cargo check > check.log 2>&1; then
+            ERR=$(tail -n 35 check.log | tr '\n' ' ' | sed 's/::/ /g')
+            echo "::error title=TauriCargoCheckFailed::$ERR"
+            cat check.log
+            exit 1
+          fi

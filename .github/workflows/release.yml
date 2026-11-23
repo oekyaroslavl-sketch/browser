@@ -59,7 +59,13 @@ jobs:
         shell: pwsh
         run: |
           npm install
-          npx tauri build
+          npx tauri build *> build.log
+          if ($LASTEXITCODE -ne 0) {
+            $err = (Get-Content build.log -Tail 35) -join " | "
+            Write-Output "::error title=TauriWinBuildFailed::$err"
+            Get-Content build.log
+            exit 1
+          }
           New-Item -ItemType Directory -Force -Path dist-out | Out-Null
           Get-ChildItem src-tauri/target/release/bundle -Recurse -File |
             Where-Object { $_.Extension -in @('.msi', '.exe') } |
@@ -136,7 +142,12 @@ jobs:
         working-directory: apps/plo_desktop
         run: |
           npm install
-          npx tauri build --bundles deb
+          if ! npx tauri build --bundles deb > build.log 2>&1; then
+            ERR=$(tail -n 35 build.log | tr '\n' ' ' | sed 's/::/ /g')
+            echo "::error title=TauriLinuxBuildFailed::$ERR"
+            cat build.log
+            exit 1
+          fi
           mkdir -p dist-out
           find src-tauri/target -type f -name "*.deb" -exec cp {} dist-out/ \;
           ls -lh dist-out/

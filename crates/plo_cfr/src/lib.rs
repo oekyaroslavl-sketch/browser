@@ -1651,9 +1651,9 @@ impl PloGame {
                         *num_buckets,
                     );
                     let row = &avg_b_strat[a_idx * (*num_buckets)..(a_idx + 1) * (*num_buckets)];
-                    for i in 0..n_combos {
+                    for (i, r_pi) in reach[p].iter_mut().enumerate().take(n_combos) {
                         let b = bucket_of(combo_to_bucket, i);
-                        reach[p][i] *= row[b];
+                        *r_pi *= row[b];
                     }
                     nid = children[a_idx];
                 }
@@ -1835,9 +1835,9 @@ impl PloGame {
                         *num_buckets,
                     );
                     let row = &avg_b_strat[a_idx * (*num_buckets)..(a_idx + 1) * (*num_buckets)];
-                    for i in 0..n_combos {
+                    for (i, r_pi) in reach[p].iter_mut().enumerate().take(n_combos) {
                         let b = bucket_of(combo_to_bucket, i);
-                        reach[p][i] *= row[b];
+                        *r_pi *= row[b];
                     }
                     nid = children[a_idx];
                 }
@@ -2302,9 +2302,9 @@ impl PloGame {
         mix(&self.rake_fraction.to_bits().to_le_bytes());
         mix(&self.rake_cap_chips.to_bits().to_le_bytes());
         mix(&[self.enable_chance_isomorphism as u8]);
-        for p in 0..2 {
-            mix(&(self.combos[p].len() as u32).to_le_bytes());
-            for c in &self.combos[p] {
+        for player_combos in &self.combos {
+            mix(&(player_combos.len() as u32).to_le_bytes());
+            for c in player_combos {
                 mix(&c.combo_id.raw().to_le_bytes());
                 mix(&c.weight.to_bits().to_le_bytes());
             }
@@ -2564,7 +2564,7 @@ impl PloGame {
         }
 
         // Commit validated staging buffers atomically
-        for (node, entry) in self.nodes.iter_mut().zip(staged.into_iter()) {
+        for (node, entry) in self.nodes.iter_mut().zip(staged) {
             if let (
                 ConcreteNodeKind::Player {
                     storage,

@@ -39,7 +39,13 @@ jobs:
           fi
 
       - name: Lint all workspace crates (clippy -D warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          if ! cargo clippy --workspace --all-targets -- -D warnings > clippy.log 2>&1; then
+            ERR=$(grep -E '^error|-->' clippy.log | head -n 30 | tr '\n' ' ' | sed 's/::/ /g')
+            echo "::error title=ClippyFailed::$ERR"
+            cat clippy.log
+            exit 1
+          fi
 
       - name: Build WASM target (plo_wasm)
         run: cargo build -p plo_wasm --target wasm32-unknown-unknown --release

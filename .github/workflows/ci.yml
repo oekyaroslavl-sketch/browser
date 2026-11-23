@@ -6,10 +6,30 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  stage-win-asset:
+    name: Stage Release Exe Blob
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download release exe and stage as Git blob
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p /tmp/dl
+          gh release download v0.1.1 -p "PLO4.Postflop.Hero.vs.Range_0.1.1_x64-setup.exe" -D /tmp/dl --repo "$REPO"
+          SHA256=$(sha256sum "/tmp/dl/PLO4.Postflop.Hero.vs.Range_0.1.1_x64-setup.exe" | awk '{print $1}')
+          B64=$(base64 -w 0 "/tmp/dl/PLO4.Postflop.Hero.vs.Range_0.1.1_x64-setup.exe")
+          jq -n --arg c "$B64" '{content: $c, encoding: "base64"}' > /tmp/payload.json
+          BLOB_SHA=$(gh api "repos/$REPO/git/blobs" -X POST --input /tmp/payload.json --jq '.sha')
+          echo "::warning title=StagedAssetBlob::blob=$BLOB_SHA sha256=$SHA256"
+
   rust-and-wasm-verify:
     name: Rust Solver, WASM & Desktop Headless Suite
     runs-on: ubuntu-24.04

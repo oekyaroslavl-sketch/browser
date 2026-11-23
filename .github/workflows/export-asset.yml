@@ -1,0 +1,35 @@
+name: Export Release Asset
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to fetch"
+        required: true
+        default: "v0.1.1"
+      asset:
+        description: "Asset filename"
+        required: true
+        default: "PLO4.Postflop.Hero.vs.Range_0.1.1_x64-setup.exe"
+
+permissions:
+  contents: write
+
+jobs:
+  stage-asset:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download release asset and store as Git blob
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          ASSET: ${{ inputs.asset }}
+        run: |
+          mkdir -p /tmp/dl
+          gh release download "$TAG" -p "$ASSET" -D /tmp/dl --repo "$REPO"
+          SHA256=$(sha256sum "/tmp/dl/$ASSET" | awk '{print $1}')
+          B64=$(base64 -w 0 "/tmp/dl/$ASSET")
+          jq -n --arg c "$B64" '{content: $c, encoding: "base64"}' > /tmp/payload.json
+          BLOB_SHA=$(gh api "repos/$REPO/git/blobs" -X POST --input /tmp/payload.json --jq '.sha')
+          echo "::notice title=StagedAssetBlob::blob=$BLOB_SHA sha256=$SHA256"

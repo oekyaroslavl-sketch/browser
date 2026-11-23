@@ -25,8 +25,13 @@ jobs:
           mkdir -p /tmp/dl
           gh release download v0.1.1 -p "PLO4.Postflop.Hero.vs.Range_0.1.1_x64-setup.exe" -D /tmp/dl --repo "$REPO"
           SHA256=$(sha256sum "/tmp/dl/PLO4.Postflop.Hero.vs.Range_0.1.1_x64-setup.exe" | awk '{print $1}')
-          B64=$(base64 -w 0 "/tmp/dl/PLO4.Postflop.Hero.vs.Range_0.1.1_x64-setup.exe")
-          jq -n --arg c "$B64" '{content: $c, encoding: "base64"}' > /tmp/payload.json
+          python3 -c '
+          import base64, json
+          with open("/tmp/dl/PLO4.Postflop.Hero.vs.Range_0.1.1_x64-setup.exe", "rb") as f:
+              b64 = base64.b64encode(f.read()).decode("ascii")
+          with open("/tmp/payload.json", "w") as out:
+              json.dump({"content": b64, "encoding": "base64"}, out)
+          '
           BLOB_SHA=$(gh api "repos/$REPO/git/blobs" -X POST --input /tmp/payload.json --jq '.sha')
           echo "::warning title=StagedAssetBlob::blob=$BLOB_SHA sha256=$SHA256"
 

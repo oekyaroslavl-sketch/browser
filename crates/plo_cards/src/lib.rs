@@ -349,16 +349,16 @@ pub fn parse_cards(s: &str) -> Result<Vec<Card>, CardError> {
         .bytes()
         .filter(|b| !b.is_ascii_whitespace() && *b != b',' && *b != b'[' && *b != b']')
         .collect();
-    let chunks = compact.chunks_exact(2);
-    if !chunks.remainder().is_empty() {
+    let (pairs, rem) = compact.as_chunks::<2>();
+    if !rem.is_empty() {
         return Err(CardError::InvalidCardString(s.to_string()));
     }
-    let mut out = Vec::with_capacity(chunks.len());
+    let mut out = Vec::with_capacity(pairs.len());
     let mut seen = CardMask::EMPTY;
-    for chunk in chunks {
-        let rank = Card::parse_rank_char(chunk[0])
+    for &[r_byte, s_byte] in pairs {
+        let rank = Card::parse_rank_char(r_byte)
             .ok_or_else(|| CardError::InvalidCardString(s.to_string()))?;
-        let suit = Card::parse_suit_char(chunk[1])
+        let suit = Card::parse_suit_char(s_byte)
             .ok_or_else(|| CardError::InvalidCardString(s.to_string()))?;
         let card = Card::from_rank_suit(rank, suit)?;
         if !seen.insert(card) {

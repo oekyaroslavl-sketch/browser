@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "PLO-4 Postflop — Hero vs Range",
+  "productName": "PLO4 Postflop Hero vs Range",
   "version": "0.1.0",
   "identifier": "org.plopostflop.herovsrange",
   "build": {

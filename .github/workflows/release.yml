@@ -40,78 +40,147 @@ jobs:
           cargo check -p plo_wasm --target wasm32-unknown-unknown
           cargo test -p plo_desktop_commands --release
 
-  build-tauri-installers:
-    name: Build Tauri 2 Native Bundle (${{ matrix.label }})
+  build-windows:
+    name: Build Windows x64 Installer (.msi & .exe)
     needs: verify-before-bundle
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: windows-latest
-            label: Windows-x64-MSI-NSIS
-            args: ""
-          - platform: macos-latest
-            label: macOS-Universal-DMG
-            args: "--target universal-apple-darwin"
-          - platform: ubuntu-22.04
-            label: Linux-x64-AppImage-Deb
-            args: ""
-
-    runs-on: ${{ matrix.platform }}
+    runs-on: windows-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Linux WebKit2GTK & AppImage dependencies
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            libxdo-dev \
-            libssl-dev
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
-
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@v2
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "apps/plo_desktop/src-tauri -> target"
 
-      - name: Build Tauri 2 Desktop Installers
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          projectPath: apps/plo_desktop/src-tauri
-          tagName: v0.1.0
-          releaseName: "PLO-4 Postflop — Hero vs Range v0.1.0"
-          releaseBody: |
-            ### PLO-4 Postflop — Hero vs Range (v0.1.0)
-            Готовые нативные установщики десктопного PLO-4 солвера и тренажёра (Tauri 2 + Rust DCFR):
-            - **Windows 10/11 (x64)**: `.msi` или `-setup.exe`
-            - **macOS (Apple Silicon + Intel Universal)**: `.dmg`
-            - **Linux (x64)**: `.AppImage` и `.deb`
+      - name: Install @tauri-apps/cli & build Windows installers
+        working-directory: apps/plo_desktop
+        shell: pwsh
+        run: |
+          npm install
+          npx tauri build
+          New-Item -ItemType Directory -Force -Path dist-out | Out-Null
+          Get-ChildItem src-tauri/target/release/bundle -Recurse -File |
+            Where-Object { $_.Extension -in @('.msi', '.exe') } |
+            ForEach-Object { Copy-Item $_.FullName -Destination ./dist-out/ -Force }
+          Get-ChildItem dist-out | Format-Table Name, Length
 
-            > **Важно**: Купленные префлоп-чарты (например, `JNandez Preflop Chart.xlsx`) не вшиты в установщик. После первого запуска откройте **⚙ Pack & Settings** и укажите локальную папку с вашим паком.
-          releaseDraft: false
-          prerelease: false
-          args: ${{ matrix.args }}
-
-      - name: Upload installer artifacts to workflow run
+      - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: plo-desktop-${{ matrix.label }}
+          name: plo4-desktop-windows-x64
           path: |
-            apps/plo_desktop/src-tauri/target/**/release/bundle/msi/*.msi
-            apps/plo_desktop/src-tauri/target/**/release/bundle/nsis/*.exe
-            apps/plo_desktop/src-tauri/target/**/release/bundle/dmg/*.dmg
-            apps/plo_desktop/src-tauri/target/**/release/bundle/deb/*.deb
-            apps/plo_desktop/src-tauri/target/**/release/bundle/appimage/*.AppImage
-          if-no-files-found: warn
+            apps/plo_desktop/dist-out/*.msi
+            apps/plo_desktop/dist-out/*.exe
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS Universal Installer (.dmg)
+    needs: verify-before-bundle
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "apps/plo_desktop/src-tauri -> target"
+
+      - name: Install @tauri-apps/cli & build macOS Universal DMG
+        working-directory: apps/plo_desktop
+        run: |
+          npm install
+          npx tauri build --target universal-apple-darwin
+          mkdir -p dist-out
+          find src-tauri/target -type f -name "*.dmg" -exec cp {} dist-out/ \;
+          ls -lh dist-out/
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plo4-desktop-macos-universal
+          path: apps/plo_desktop/dist-out/*.dmg
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux x64 Package (.deb)
+    needs: verify-before-bundle
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install WebKit2GTK system headers
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            file
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "apps/plo_desktop/src-tauri -> target"
+
+      - name: Install @tauri-apps/cli & build Linux .deb
+        working-directory: apps/plo_desktop
+        run: |
+          npm install
+          npx tauri build --bundles deb
+          mkdir -p dist-out
+          find src-tauri/target -type f -name "*.deb" -exec cp {} dist-out/ \;
+          ls -lh dist-out/
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plo4-desktop-linux-x64
+          path: apps/plo_desktop/dist-out/*.deb
+          if-no-files-found: error
+
+  publish-github-release:
+    name: Publish GitHub Release (v0.1.0)
+    needs: [build-windows, build-macos, build-linux]
+    if: always() && (needs.build-windows.result == 'success' || needs.build-macos.result == 'success' || needs.build-linux.result == 'success')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download built installers
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create or update GitHub Release v0.1.0 with direct download links
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          ls -lh release-assets/
+          if gh release view v0.1.0 --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload v0.1.0 release-assets/* --clobber --repo "$REPO"
+          else
+            gh release create v0.1.0 release-assets/* \
+              --repo "$REPO" \
+              --target "${{ github.sha }}" \
+              --title "PLO-4 Postflop — Hero vs Range v0.1.0" \
+              --notes "$(cat <<'EOF'
+          ### Скачать PLO-4 Postflop — Hero vs Range (v0.1.0)
+          Нативные десктопные установщики (Tauri 2 + Rust DCFR):
+          - **Windows 10/11 (x64)**: скачайте `.exe` (`*-setup.exe`) или `.msi`
+          - **macOS (Apple Silicon + Intel Universal)**: скачайте `.dmg`
+          - **Linux (Ubuntu/Debian x64)**: скачайте `.deb`
+
+          > **Примечание**: Покупные префлоп-чарты (например, `JNandez Preflop Chart.xlsx`) не вшиты в установщик. После запуска нажмите **⚙ Pack & Settings** и укажите папку с вашим локальным паком.
+          EOF
+          )"
+          fi

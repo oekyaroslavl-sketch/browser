@@ -35,7 +35,7 @@ jobs:
 
       - name: Lint & run headless desktop verification (t1..t18)
         run: |
-          if ! cargo clippy --workspace --all-targets -- -D warnings > clippy.log 2>&1; then
+          if ! CARGO_TERM_COLOR=never cargo clippy --workspace --all-targets -- -D warnings > clippy.log 2>&1; then
             ERR=$(grep -E '^error|-->' clippy.log | head -n 30 | tr '\n' ' ' | sed 's/::/ /g')
             echo "::error title=ClippyFailed::$ERR"
             cat clippy.log

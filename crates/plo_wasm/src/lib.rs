@@ -188,7 +188,7 @@ impl WasmPloSession {
                 (1, 1)
             } else if k == 2 {
                 (1, 2)
-            } else if k % 2 == 0 {
+            } else if (k & 1) == 0 {
                 (k / 2, 2)
             } else {
                 (k, 1)

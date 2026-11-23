@@ -1335,7 +1335,7 @@ impl PloGame {
                 return expl;
             }
             self.solve_step();
-            if (i + 1) % 25 == 0 || i + 1 == max_iterations {
+            if (i + 1).is_multiple_of(25) || i + 1 == max_iterations {
                 expl = self.exploitability();
             }
         }
@@ -1380,14 +1380,14 @@ impl PloGame {
             }
             self.solve_step();
             let done = i + 1;
-            if done % stride == 0 || done == max_iterations {
+            if done.is_multiple_of(stride) || done == max_iterations {
                 expl = self.exploitability_f64();
                 evs = self.root_expected_values_f64();
                 on_progress(self.iterations_run, expl, evs);
             }
         }
 
-        if stopped || max_iterations % stride != 0 {
+        if stopped || !max_iterations.is_multiple_of(stride) {
             expl = self.exploitability_f64();
             evs = self.root_expected_values_f64();
             on_progress(self.iterations_run, expl, evs);

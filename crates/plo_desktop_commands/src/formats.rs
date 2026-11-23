@@ -418,6 +418,10 @@ impl<'a> JsonParser<'a> {
 // Part 2: Pure-Rust ZIP Central Directory + RFC 1951 DEFLATE Reader (for .xlsx)
 // ============================================================================
 
+const MAX_ZIP_ENTRY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ZIP_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+const MAX_ZIP_ENTRIES: usize = 4_096;
+
 /// Reads all entries of a `.zip` / `.xlsx` archive into a map of `entry_name -> decompressed_bytes`.
 pub fn read_zip_entries(archive_bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
     if archive_bytes.len() < 22 {
@@ -440,9 +444,15 @@ pub fn read_zip_entries(archive_bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>
     }
     let eocd = eocd_pos.ok_or_else(|| "missing ZIP End-of-Central-Directory signature".to_string())?;
     let total_entries = read_u16_le(archive_bytes, eocd + 10) as usize;
+    if total_entries > MAX_ZIP_ENTRIES {
+        return Err(format!(
+            "ZIP archive has too many entries ({total_entries} > {MAX_ZIP_ENTRIES})"
+        ));
+    }
     let cd_offset = read_u32_le(archive_bytes, eocd + 16) as usize;
 
     let mut out = BTreeMap::new();
+    let mut total_unpacked: usize = 0;
     let mut pos = cd_offset;
     for _ in 0..total_entries {
         if pos + 46 > archive_bytes.len() || read_u32_le(archive_bytes, pos) != 0x0201_4b50 {
@@ -465,6 +475,11 @@ pub fn read_zip_entries(archive_bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>
         if name.ends_with('/') {
             continue;
         }
+        if uncomp_size > MAX_ZIP_ENTRY_BYTES {
+            return Err(format!(
+                "ZIP entry {name} uncompressed size ({uncomp_size} bytes) exceeds 64 MiB safety limit"
+            ));
+        }
 
         if local_offset + 30 > archive_bytes.len()
             || read_u32_le(archive_bytes, local_offset) != 0x0403_4b50
@@ -478,11 +493,24 @@ pub fn read_zip_entries(archive_bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>
             .get(data_start..data_start + comp_size)
             .ok_or_else(|| format!("truncated compressed payload for {name}"))?;
 
+        let remaining_budget = MAX_ZIP_TOTAL_BYTES
+            .checked_sub(total_unpacked)
+            .ok_or_else(|| "ZIP archive exceeds total 128 MiB unpacked safety limit".to_string())?;
+        let entry_cap = MAX_ZIP_ENTRY_BYTES.min(remaining_budget);
+
         let data = match method {
-            0 => comp_slice.to_vec(),
-            8 => inflate_raw(comp_slice, uncomp_size)?,
+            0 => {
+                if comp_slice.len() > entry_cap {
+                    return Err(format!(
+                        "ZIP stored entry {name} exceeds unpacked safety limit ({entry_cap} bytes)"
+                    ));
+                }
+                comp_slice.to_vec()
+            }
+            8 => inflate_raw(comp_slice, uncomp_size, entry_cap)?,
             m => return Err(format!("unsupported ZIP compression method {m} in {name}")),
         };
+        total_unpacked = total_unpacked.saturating_add(data.len());
         out.insert(name, data);
     }
 
@@ -668,7 +696,11 @@ fn decode_dynamic_trees(br: &mut BitReader<'_>) -> Result<(HuffmanTree, HuffmanT
     Ok((lit_tree, dist_tree))
 }
 
-fn inflate_raw(input: &[u8], expected_size: usize) -> Result<Vec<u8>, String> {
+fn inflate_raw(
+    input: &[u8],
+    expected_size: usize,
+    max_output_bytes: usize,
+) -> Result<Vec<u8>, String> {
     const LEN_BASE: [usize; 29] = [
         3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
         131, 163, 195, 227, 258,
@@ -686,7 +718,9 @@ fn inflate_raw(input: &[u8], expected_size: usize) -> Result<Vec<u8>, String> {
     ];
 
     let mut br = BitReader::new(input);
-    let mut out = Vec::with_capacity(expected_size);
+    // Never trust header `expected_size` blindly for initial heap reservation (ZIP bomb guard).
+    let initial_cap = expected_size.min(1024 * 1024).min(max_output_bytes);
+    let mut out = Vec::with_capacity(initial_cap);
 
     loop {
         let bfinal = br.read_bits(1)?;
@@ -697,6 +731,11 @@ fn inflate_raw(input: &[u8], expected_size: usize) -> Result<Vec<u8>, String> {
                 let nlen = br.read_u16_aligned()?;
                 if (len as u16) != !nlen {
                     return Err("stored DEFLATE block length mismatch".to_string());
+                }
+                if out.len().saturating_add(len) > max_output_bytes {
+                    return Err(format!(
+                        "DEFLATE stream exceeds safety limit ({max_output_bytes} bytes)"
+                    ));
                 }
                 for _ in 0..len {
                     out.push(br.read_bits(8)? as u8);
@@ -711,6 +750,11 @@ fn inflate_raw(input: &[u8], expected_size: usize) -> Result<Vec<u8>, String> {
                 loop {
                     let sym = lit_tree.decode(&mut br)? as usize;
                     if sym < 256 {
+                        if out.len() >= max_output_bytes {
+                            return Err(format!(
+                                "DEFLATE stream exceeds safety limit ({max_output_bytes} bytes)"
+                            ));
+                        }
                         out.push(sym as u8);
                     } else if sym == 256 {
                         break;
@@ -726,6 +770,11 @@ fn inflate_raw(input: &[u8], expected_size: usize) -> Result<Vec<u8>, String> {
                             DIST_BASE[d_sym] + br.read_bits(DIST_EXTRA[d_sym])? as usize;
                         if dist == 0 || dist > out.len() {
                             return Err("DEFLATE back-reference out of bounds".to_string());
+                        }
+                        if out.len().saturating_add(length) > max_output_bytes {
+                            return Err(format!(
+                                "DEFLATE stream exceeds safety limit ({max_output_bytes} bytes)"
+                            ));
                         }
                         for _ in 0..length {
                             let b = out[out.len() - dist];

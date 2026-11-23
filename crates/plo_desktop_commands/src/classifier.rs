@@ -400,7 +400,7 @@ fn match_positive_token(
         "nfd" | "nutfd" | "nut_fd" | "nutflushdraw" => return f.has_nut_fd,
         "fd" | "flushdraw" => return f.has_any_fd,
         "wrap" => return f.straight_out_ranks >= 3,
-        "sd" | "oesd" | "gs" | " gutshot" | "straightdraw" => return f.straight_out_ranks >= 1,
+        "sd" | "oesd" | "gs" | "gutshot" | "straightdraw" => return f.straight_out_ranks >= 1,
         "blocker" | "nutblocker" | "nut_blocker" | "nfb" => return f.has_nut_flush_blocker,
         "air" => return f.primary_class == PloHandClass::Air,
         _ => {}

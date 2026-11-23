@@ -449,6 +449,12 @@ impl fmt::Debug for ComboId {
 
 /// A 4-card Pot-Limit Omaha hole hand, guaranteed to contain 4 distinct cards
 /// stored in strictly ascending order `c0 < c1 < c2 < c3`.
+///
+/// # Ordering Note (`Ord` vs `ComboId`)
+/// `Hand4`'s `PartialOrd`/`Ord` derive uses **lexicographic** tuple order `(c0, c1, c2, c3)`,
+/// whereas [`ComboId`] uses **colexicographic** (combinatorial number system) order
+/// `C(c0,1) + C(c1,2) + C(c2,3) + C(c3,4)`. Do not assume `h1 < h2` iff `h1.combo_id() < h2.combo_id()`;
+/// range storage and binary searches in `plo_range` / `plo_cfr` sort explicitly by `ComboId`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hand4([Card; 4]);
 

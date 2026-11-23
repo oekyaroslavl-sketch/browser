@@ -5,7 +5,7 @@ use plo_eval::{eval_plo_river, init_tables, RiverBoardCache};
 fn main() {
     init_tables();
 
-    // Generate 4,000 live 4-card PLO hands on a fixed river board [As Ks Td 7h 2c]
+    // Generate 5,000 live 4-card PLO hands on a fixed river board [As Ks Td 7h 2c]
     let river = [
         "As".parse::<Card>().unwrap(),
         "Ks".parse::<Card>().unwrap(),

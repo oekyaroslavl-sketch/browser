@@ -163,7 +163,7 @@ cargo test --workspace --release
     libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
   ```
 - **Zero-Dependency Local Desktop Bridge (`plo_desktop_preview`)**:
-  In headless Linux environments where `webkit2gtk` headers are not installed, `crates/plo_desktop_commands` also powers a local HTTP/SSE bridge serving the exact `apps/plo_desktop/ui/` frontend over `0.0.0.0`:
+  In headless Linux environments where `webkit2gtk` headers are not installed, `crates/plo_desktop_commands` also powers a local HTTP/SSE bridge serving the exact `apps/plo_desktop/ui/` frontend on `127.0.0.1:4173` by default (pass `--host 0.0.0.0` only inside isolated preview containers):
   ```bash
   cargo run -p plo_desktop_commands --bin plo_desktop_preview --release
   ```
@@ -184,8 +184,8 @@ cargo test --workspace --release
 - **Play vs GTO Solver Bot (`start_bot_hand`, `bot_play_hero_action`, `stop_bot_hand`)**: Samples a live non-overlapping 4-card Villain hand from root weights, plays Villain actions strictly from that combo's solved GTO distribution, deals random live Turn/River cards at `Chance` nodes, grades Hero's decisions, and reveals Villain's 2+3 hand at showdown.
 - **Auto-Simplify Pure-Size Optimizer (`compare_bet_simplifications`) & Multi-Flop Subset Report (`run_flop_subset_report`)**: Benchmarks single bet sizes (`33%`–`100%`) against multi-size baselines (`EV Retention %`) and runs batch `FlopOnly` C-bet/EV reports across representative flop textures.
 
-### 7.3 Binary `.plotree` Snapshots (`PLOTREE1` + `PLOSNAP1`)
-- `save_tree_snapshot` and `load_tree_snapshot` serialize `SpotConfig` together with `PloGame::export_weights_binary()` (`regrets`, `cum_strategy`, and `locked_strategy` buffers) into compact `.plotree` files (gitignored via `*.plotree`) that reload in milliseconds without re-running DCFR.
+### 7.3 Binary `.plotree` Snapshots (`PLOTREE2` + `PLOSNAP2`)
+- `save_tree_snapshot` and `load_tree_snapshot` serialize `SpotConfig` together with `PloGame::export_weights_binary()` (`regrets`, `cum_strategy`, and `locked_strategy` buffers) into compact `.plotree` files (`PLOTREE2` container + `PLOSNAP2` payload carrying a 64-bit structural config hash, finite-float validation, atomic staging commit, and explicit human-readable rejection of legacy `PLOTREE1`/`PLOSNAP1` snapshots) that reload in milliseconds without re-running DCFR.
 
 ### 7.4 Keyboard Shortcuts
 - `1`–`5`: Choose action `1..5` at the active decision node

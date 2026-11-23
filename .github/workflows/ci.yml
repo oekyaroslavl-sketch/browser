@@ -38,8 +38,8 @@ jobs:
             exit 1
           fi
 
-      - name: Lint all workspace crates (clippy)
-        run: cargo clippy --workspace --all-targets
+      - name: Lint all workspace crates (clippy -D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build WASM target (plo_wasm)
         run: cargo build -p plo_wasm --target wasm32-unknown-unknown --release

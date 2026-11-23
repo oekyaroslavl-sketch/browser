@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "plo_cards"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "plo_cfr"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "plo_cards",
  "plo_eval",
@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "plo_desktop_commands"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "plo_cards",
  "plo_cfr",
@@ -31,21 +31,21 @@ dependencies = [
 
 [[package]]
 name = "plo_eval"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "plo_cards",
 ]
 
 [[package]]
 name = "plo_iso"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "plo_cards",
 ]
 
 [[package]]
 name = "plo_range"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "plo_cards",
  "plo_eval",
@@ -54,14 +54,14 @@ dependencies = [
 
 [[package]]
 name = "plo_tree"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "plo_cards",
 ]
 
 [[package]]
 name = "plo_wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "plo_cards",
  "plo_cfr",

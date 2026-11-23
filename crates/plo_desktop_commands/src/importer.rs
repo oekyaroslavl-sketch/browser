@@ -106,7 +106,7 @@ impl LoadedRangePack {
         }
 
         let mut files = Vec::new();
-        collect_files_recursive(folder, &mut files)?;
+        collect_files_recursive(folder, 0, &mut files)?;
         files.sort();
 
         let mut raw_sources: BTreeMap<String, (String, PloRange)> = BTreeMap::new();
@@ -128,6 +128,15 @@ impl LoadedRangePack {
                     if rel.split('/').any(|seg| seg.starts_with("~$")) {
                         continue; // Skip Excel lock files
                     }
+                    let meta = fs::metadata(&path)
+                        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+                    if meta.len() > MAX_IMPORT_FILE_BYTES {
+                        return Err(format!(
+                            "workbook {} ({} bytes) exceeds 64 MiB safety limit",
+                            rel,
+                            meta.len()
+                        ));
+                    }
                     let bytes = fs::read(&path)
                         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
                     let sheets = read_xlsx_workbook(&bytes)
@@ -137,6 +146,15 @@ impl LoadedRangePack {
                     }
                 }
                 "txt" | "plo" | "csv" | "tsv" => {
+                    let meta = fs::metadata(&path)
+                        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+                    if meta.len() > MAX_IMPORT_FILE_BYTES {
+                        return Err(format!(
+                            "range file {} ({} bytes) exceeds 64 MiB safety limit",
+                            rel,
+                            meta.len()
+                        ));
+                    }
                     let text = fs::read_to_string(&path)
                         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
                     if let Some(range) = parse_text_range_file(&text)? {
@@ -459,15 +477,38 @@ pub const CANONICAL_SPOT_RULES: &[(&str, SpotGroup, &str, &str, &str)] = &[
     ),
 ];
 
-fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+const MAX_IMPORT_RECURSION_DEPTH: usize = 8;
+const MAX_IMPORT_FILES: usize = 2_048;
+const MAX_IMPORT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn collect_files_recursive(
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if depth > MAX_IMPORT_RECURSION_DEPTH {
+        return Ok(());
+    }
     let entries =
         fs::read_dir(dir).map_err(|e| format!("cannot read directory {}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("directory iteration error: {e}"))?;
+        let ftype = entry
+            .file_type()
+            .map_err(|e| format!("cannot inspect file type in {}: {e}", dir.display()))?;
+        // Do not follow symlinks so cyclic directory links cannot loop or escape the pack folder.
+        if ftype.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
-            collect_files_recursive(&path, out)?;
-        } else if path.is_file() {
+        if ftype.is_dir() {
+            collect_files_recursive(&path, depth + 1, out)?;
+        } else if ftype.is_file() {
+            if out.len() >= MAX_IMPORT_FILES {
+                return Err(format!(
+                    "range pack directory exceeds safety limit of {MAX_IMPORT_FILES} files"
+                ));
+            }
             out.push(path);
         }
     }

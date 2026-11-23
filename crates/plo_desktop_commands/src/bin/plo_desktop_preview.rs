@@ -1,8 +1,10 @@
-//! Zero-dependency native HTTP + SSE bridge serving `apps/plo_desktop/ui/` on `0.0.0.0:4173`
-//! (or `$PORT`) and executing all `plo_desktop_commands` natively in Rust.
+//! Zero-dependency native HTTP + SSE bridge serving `apps/plo_desktop/ui/` on `127.0.0.1:4173`
+//! by default (override via `--host 0.0.0.0` / `$HOST`, `--port` / `$PORT`, `--ui`) and executing
+//! `plo_desktop_commands` natively in Rust.
 //!
-//! Used for instant live preview & headless Linux testing where `webkit2gtk` system packages
-//! are absent, while `apps/plo_desktop/src-tauri` builds the native Windows/macOS/Linux Tauri 2 shell.
+//! Security note: This binary has no HTTP authentication and exposes local solver/file commands;
+//! keep it bound to `127.0.0.1` on developer machines and only pass `--host 0.0.0.0` inside isolated
+//! preview containers!
 
 use std::env;
 use std::fs;
@@ -51,11 +53,35 @@ fn find_ui_dir() -> PathBuf {
 }
 
 fn main() {
-    let port: u16 = env::var("PORT")
+    let mut host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let mut port: u16 = env::var("PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4173);
-    let ui_dir = find_ui_dir();
+    let mut ui_dir = find_ui_dir();
+
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut idx = 0usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--host" if idx + 1 < args.len() => {
+                host = args[idx + 1].clone();
+                idx += 2;
+            }
+            "--port" if idx + 1 < args.len() => {
+                if let Ok(p) = args[idx + 1].parse::<u16>() {
+                    port = p;
+                }
+                idx += 2;
+            }
+            "--ui" if idx + 1 < args.len() => {
+                ui_dir = PathBuf::from(&args[idx + 1]);
+                idx += 2;
+            }
+            _ => idx += 1,
+        }
+    }
+
     let state = Arc::new(DesktopState::default());
 
     // If no pack is saved yet and `.local/nandez_pack` exists locally, auto-load it for convenience
@@ -67,7 +93,7 @@ fn main() {
     }
 
     let sse = Arc::new(SseBroadcaster::new());
-    let addr = format!("0.0.0.0:{port}");
+    let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr).expect("failed to bind preview server");
     println!(
         "PLO-4 Postflop — Hero vs Range UI bridge listening on http://{addr} (serving {})",

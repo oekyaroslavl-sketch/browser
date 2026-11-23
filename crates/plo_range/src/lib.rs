@@ -93,12 +93,13 @@ impl PloRange {
         }
     }
 
-    /// Builds a `PloRange` from `(Hand4, f32)` pairs. Duplicate hands have their latest positive
-    /// weight kept (or use `from_hands_additive` to sum weights); zero/negative weights are dropped.
+    /// Builds a `PloRange` from `(Hand4, f32)` pairs (`0.0 <= weight <= 1.0`). Duplicate hands
+    /// have their latest positive weight kept; zero weights are dropped; negative, `> 1.0`, or
+    /// non-finite weights return `Err(RangeError::InvalidWeight)`.
     pub fn from_hands(iter: impl IntoIterator<Item = (Hand4, f32)>) -> Result<Self, RangeError> {
         let mut entries = Vec::new();
         for (hand, weight) in iter {
-            if !weight.is_finite() || weight < 0.0 {
+            if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
                 return Err(RangeError::InvalidWeight(weight.to_string()));
             }
             if weight > 0.0 {
@@ -127,20 +128,25 @@ impl PloRange {
         Ok(Self { entries: out })
     }
 
-    /// Inserts or updates a single 4-card hand's weight (`weight == 0.0` removes it).
+    /// Inserts or updates a single 4-card hand's weight (`weight <= 0.0` removes it;
+    /// positive weights are clamped to `<= 1.0`, ignoring `NaN`).
     pub fn set_weight(&mut self, hand: Hand4, weight: f32) {
+        if !weight.is_finite() {
+            return;
+        }
+        let w = weight.min(1.0);
         let cid = hand.combo_id();
         match self.entries.binary_search_by_key(&cid, |e| e.combo_id) {
             Ok(idx) => {
-                if weight <= 0.0 {
+                if w <= 0.0 {
                     self.entries.remove(idx);
                 } else {
-                    self.entries[idx].weight = weight;
+                    self.entries[idx].weight = w;
                 }
             }
             Err(idx) => {
-                if weight > 0.0 {
-                    self.entries.insert(idx, WeightedHand::new(hand, weight));
+                if w > 0.0 {
+                    self.entries.insert(idx, WeightedHand::new(hand, w));
                 }
             }
         }
@@ -300,7 +306,7 @@ fn expand_pattern_into(
     out: &mut Vec<(ComboId, Hand4, f32)>,
 ) -> Result<(), RangeError> {
     let pat = pat.trim();
-    if pat == "*" || pat.eq_ignore_ascii_case("all") {
+    if pat == "*" || pat == "100%" || pat.eq_ignore_ascii_case("all") {
         for (cid, hand) in Hand4::all_hands() {
             out.push((cid, hand, weight));
         }
@@ -1131,5 +1137,13 @@ mod tests {
                 "Hold'em token `{illegal_holdem_token}` must NEVER parse as a PLO-4 range!"
             );
         }
+
+        // 7) `100%` full-universe token & `from_hands` `[0.0..=1.0]` weight validation:
+        let full_pct: PloRange = "100%".parse().unwrap();
+        assert_eq!(full_pct.len(), 270_725);
+        let h_sample: Hand4 = "AsKsQhJh".parse().unwrap();
+        assert!(PloRange::from_hands([(h_sample, 1.5)]).is_err());
+        assert!(PloRange::from_hands([(h_sample, -0.1)]).is_err());
+        assert!(PloRange::from_hands([(h_sample, f32::NAN)]).is_err());
     }
 }

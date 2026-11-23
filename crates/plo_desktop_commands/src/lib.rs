@@ -243,6 +243,14 @@ struct ActiveGameSession {
     parent_session: Option<Box<ActiveGameSession>>,
 }
 
+struct SolvingGuard<'a>(&'a AtomicBool);
+
+impl Drop for SolvingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Thread-safe stateful command engine shared by headless tests, Tauri 2 IPC commands,
 /// and the local preview server.
 pub struct DesktopState {
@@ -286,6 +294,13 @@ impl DesktopState {
 
     pub fn is_solving(&self) -> bool {
         self.solving_flag.load(Ordering::SeqCst)
+    }
+
+    fn acquire_exclusive_op(&self, busy_msg: &str) -> Result<SolvingGuard<'_>, String> {
+        self.solving_flag
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| SolvingGuard(&self.solving_flag))
+            .map_err(|_| busy_msg.to_string())
     }
 
     // ========================================================================
@@ -984,9 +999,8 @@ impl DesktopState {
 
     /// Builds and stores a `PloGame` in session state after strictly checking `estimate_tree_memory <= budget`.
     pub fn build_game(&self, cfg: &SpotConfig) -> Result<Json, String> {
-        if self.is_solving() {
-            return Err("A solve is currently running; click Stop first".to_string());
-        }
+        let _exclusive =
+            self.acquire_exclusive_op("A solve is currently running; click Stop first")?;
         let prep = self.prepare_spot(cfg)?;
 
         // Always enforce pre-allocation memory budget guardrail!
@@ -1054,24 +1068,11 @@ impl DesktopState {
     where
         F: FnMut(&SolveProgressEvent),
     {
-        if self
-            .solving_flag
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err("Solver is already running".to_string());
-        }
+        let exclusive = self.acquire_exclusive_op("Solver is already running")?;
         self.stop_flag.store(false, Ordering::SeqCst);
 
         // Build fresh game for `cfg`
-        let build_res = self.prepare_and_build_unlocked(cfg);
-        let mut active = match build_res {
-            Ok(s) => s,
-            Err(e) => {
-                self.solving_flag.store(false, Ordering::SeqCst);
-                return Err(e);
-            }
-        };
+        let mut active = self.prepare_and_build_unlocked(cfg)?;
 
         let max_iters = cfg.max_iterations.max(1);
         let pot_f64 = active.game.tree_config().starting_pot as f64;
@@ -1163,7 +1164,7 @@ impl DesktopState {
         on_progress(&final_event);
 
         *self.session.lock().unwrap() = Some(active);
-        self.solving_flag.store(false, Ordering::SeqCst);
+        drop(exclusive);
 
         let node_json = self.query_node()?;
         Ok(Json::obj([
@@ -1174,9 +1175,7 @@ impl DesktopState {
 
     /// Steps additional iterations on the already-built `PloGame` without resetting regrets.
     pub fn step_iterations(&self, extra_iterations: u32) -> Result<Json, String> {
-        if self.is_solving() {
-            return Err("Solver is currently running".to_string());
-        }
+        let exclusive = self.acquire_exclusive_op("Solver is currently running")?;
         let mut guard = self.session.lock().unwrap();
         let sess = guard
             .as_mut()
@@ -1211,6 +1210,7 @@ impl DesktopState {
             status: if stopped { "stopped" } else { "completed" }.to_string(),
         };
         drop(guard);
+        drop(exclusive);
         let node = self.query_node()?;
         Ok(Json::obj([("progress", ev.to_json()), ("node", node)]))
     }
@@ -1270,9 +1270,8 @@ impl DesktopState {
         max_iterations: u32,
         target_dev_pct: f64,
     ) -> Result<Json, String> {
-        if self.is_solving() {
-            return Err("Solver is currently running; click Stop first".to_string());
-        }
+        let _exclusive =
+            self.acquire_exclusive_op("Solver is currently running; click Stop first")?;
         let mut guard = self.session.lock().unwrap();
         let prev = guard
             .take()
@@ -1462,9 +1461,8 @@ impl DesktopState {
         class_locks: &std::collections::BTreeMap<String, Vec<f32>>,
         resolve_iterations: u32,
     ) -> Result<Json, String> {
-        if self.is_solving() {
-            return Err("Solver is currently running; click Stop first".to_string());
-        }
+        let _exclusive =
+            self.acquire_exclusive_op("Solver is currently running; click Stop first")?;
         let mut guard = self.session.lock().unwrap();
         let sess = guard
             .as_mut()
@@ -1548,9 +1546,8 @@ impl DesktopState {
         flops: &[String],
         iterations_per_flop: u32,
     ) -> Result<Json, String> {
-        if self.is_solving() {
-            return Err("Solver is currently running; click Stop first".to_string());
-        }
+        let _exclusive =
+            self.acquire_exclusive_op("Solver is currently running; click Stop first")?;
         let default_subset = [
             "AsKs7d", // A-high Broadway Two-Tone
             "KsQhJc", // High Broadway Rainbow
@@ -1684,9 +1681,8 @@ impl DesktopState {
         villain_override_opt: &str,
         iters_per_street: u32,
     ) -> Result<Json, String> {
-        if self.is_solving() {
-            return Err("Solver is currently running; click Stop first".to_string());
-        }
+        let _exclusive =
+            self.acquire_exclusive_op("Solver is currently running; click Stop first")?;
         let parsed = parse_plo4_hand_history(hh_text)?;
         let iters = iters_per_street.clamp(40, 1000);
         let chips_per_bb = parsed.chips_per_bb.max(1e-6);
@@ -1998,9 +1994,8 @@ impl DesktopState {
         candidate_sizes: &[String],
         iterations: u32,
     ) -> Result<Json, String> {
-        if self.is_solving() {
-            return Err("Solver is currently running; click Stop first".to_string());
-        }
+        let _exclusive =
+            self.acquire_exclusive_op("Solver is currently running; click Stop first")?;
         let board = parse_postflop_board(&base_cfg.board)?;
         let street_mode = match board.street() {
             Street::Flop => "FlopOnly",
@@ -2124,9 +2119,8 @@ impl DesktopState {
     /// `#5 (Phase 3)` Saves the currently solved `PloGame` (`SpotConfig` + binary `regrets`/`cum_strategy` + `convergence_log`)
     /// to a compact `.plotree` snapshot file (or returns base64/hex-free portable `.plotree` file on disk)!
     pub fn save_tree_snapshot(&self, file_path: &str) -> Result<Json, String> {
-        if self.is_solving() {
-            return Err("Solver is currently running; click Stop first".to_string());
-        }
+        let _exclusive =
+            self.acquire_exclusive_op("Solver is currently running; click Stop first")?;
         let guard = self.session.lock().unwrap();
         let sess = guard
             .as_ref()
@@ -2144,10 +2138,10 @@ impl DesktopState {
             }
         }
 
-        // Binary `.plotree` container format:
-        // - `PLOTREE1` (8 bytes)
+        // Binary `.plotree` container format (`PLOTREE2` + `PLOSNAP2`):
+        // - `PLOTREE2` (8 bytes)
         // - `cfg_json_len: u32 LE` + UTF-8 `SpotConfig` JSON bytes
-        // - `weights_len: u32 LE` + `PloGame::export_weights_binary()` bytes
+        // - `weights_len: u32 LE` + `PloGame::export_weights_binary()` (`PLOSNAP2` + 64-bit hash) bytes
         let mut cfg_to_save = sess.spot_config.clone();
         // Record exact resolved abstraction so `load_tree_snapshot` builds identical bucket topology!
         cfg_to_save.abstraction_mode = match sess.abstraction {
@@ -2159,7 +2153,7 @@ impl DesktopState {
         let weight_bytes = sess.game.export_weights_binary();
 
         let mut container = Vec::with_capacity(16 + cfg_bytes.len() + weight_bytes.len());
-        container.extend_from_slice(b"PLOTREE1");
+        container.extend_from_slice(b"PLOTREE2");
         container.extend_from_slice(&(cfg_bytes.len() as u32).to_le_bytes());
         container.extend_from_slice(&cfg_bytes);
         container.extend_from_slice(&(weight_bytes.len() as u32).to_le_bytes());
@@ -2178,14 +2172,19 @@ impl DesktopState {
 
     /// `#5 (Phase 3)` Loads a `.plotree` binary tree snapshot from disk in milliseconds without re-running DCFR!
     pub fn load_tree_snapshot(&self, file_path: &str) -> Result<Json, String> {
-        if self.is_solving() {
-            return Err("Solver is currently running; click Stop first".to_string());
-        }
+        let _exclusive =
+            self.acquire_exclusive_op("Solver is currently running; click Stop first")?;
         let path = PathBuf::from(file_path.trim());
         let data = fs::read(&path)
             .map_err(|e| format!("Failed to read .plotree snapshot {}: {e}", path.display()))?;
-        if data.len() < 16 || &data[0..8] != b"PLOTREE1" {
-            return Err("Invalid .plotree file header (expected PLOTREE1)".to_string());
+        if data.len() >= 8 && &data[0..8] == b"PLOTREE1" {
+            return Err(
+                "Legacy PLOTREE1 snapshot is incompatible with v0.1.1+ (expected PLOTREE2 with config hash); please re-save the spot"
+                    .to_string(),
+            );
+        }
+        if data.len() < 16 || &data[0..8] != b"PLOTREE2" {
+            return Err("Invalid .plotree file header (expected PLOTREE2)".to_string());
         }
         let cfg_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
         if 12 + cfg_len + 4 > data.len() {
@@ -2266,9 +2265,8 @@ impl DesktopState {
         action_probs: &[f32],
         resolve_iterations: u32,
     ) -> Result<Json, String> {
-        if self.is_solving() {
-            return Err("Solver is currently running; click Stop first".to_string());
-        }
+        let _exclusive =
+            self.acquire_exclusive_op("Solver is currently running; click Stop first")?;
         let mut guard = self.session.lock().unwrap();
         let sess = guard
             .as_mut()
@@ -2291,9 +2289,8 @@ impl DesktopState {
 
     /// Unlocks the current decision node (or all nodes when `all == true`) and optionally runs `resolve_iterations`.
     pub fn unlock_node(&self, all: bool, resolve_iterations: u32) -> Result<Json, String> {
-        if self.is_solving() {
-            return Err("Solver is currently running; click Stop first".to_string());
-        }
+        let _exclusive =
+            self.acquire_exclusive_op("Solver is currently running; click Stop first")?;
         let mut guard = self.session.lock().unwrap();
         let sess = guard
             .as_mut()

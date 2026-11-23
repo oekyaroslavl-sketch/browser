@@ -2,7 +2,6 @@ name: Release Desktop Installers
 
 on:
   push:
-    branches: ["arena/**"]
     tags:
       - "v*.*.*"
   workflow_dispatch:
@@ -36,7 +35,7 @@ jobs:
 
       - name: Lint & run headless desktop verification (t1..t18)
         run: |
-          cargo clippy --workspace --all-targets
+          cargo clippy --workspace --all-targets -- -D warnings
           cargo check -p plo_wasm --target wasm32-unknown-unknown
           cargo test -p plo_desktop_commands --release
 
@@ -160,7 +159,7 @@ jobs:
           if-no-files-found: error
 
   publish-github-release:
-    name: Publish GitHub Release (v0.1.0)
+    name: Publish GitHub Release
     needs: [build-windows, build-macos, build-linux]
     if: always() && (needs.build-windows.result == 'success' || needs.build-macos.result == 'success' || needs.build-linux.result == 'success')
     runs-on: ubuntu-24.04
@@ -171,27 +170,34 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Create or update GitHub Release v0.1.0 with direct download links
+      - name: Create or update GitHub Release with direct download links
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
+          TAG="v0.1.1"
+          if [[ "$REF_NAME" == v*.*.* ]]; then
+            TAG="$REF_NAME"
+          fi
           ls -lh release-assets/
-          if gh release view v0.1.0 --repo "$REPO" >/dev/null 2>&1; then
-            gh release upload v0.1.0 release-assets/* --clobber --repo "$REPO"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber --repo "$REPO"
           else
-            gh release create v0.1.0 release-assets/* \
+            gh release create "$TAG" release-assets/* \
               --repo "$REPO" \
               --target "${{ github.sha }}" \
-              --title "PLO-4 Postflop — Hero vs Range v0.1.0" \
-              --notes "$(cat <<'EOF'
-          ### Скачать PLO-4 Postflop — Hero vs Range (v0.1.0)
+              --title "PLO-4 Postflop — Hero vs Range $TAG" \
+              --notes "$(cat <<EOF
+          ### Скачать PLO-4 Postflop — Hero vs Range ($TAG)
           Нативные десктопные установщики (Tauri 2 + Rust DCFR):
-          - **Windows 10/11 (x64)**: скачайте `.exe` (`*-setup.exe`) или `.msi`
-          - **macOS (Apple Silicon + Intel Universal)**: скачайте `.dmg`
-          - **Linux (Ubuntu/Debian x64)**: скачайте `.deb`
+          - **Windows 10/11 (x64)**: скачайте \`.exe\` (\`*-setup.exe\`) или \`.msi\`
+          - **macOS (Apple Silicon + Intel Universal)**: скачайте \`.dmg\`
+          - **Linux (Ubuntu/Debian x64)**: скачайте \`.deb\`
 
-          > **Примечание**: Покупные префлоп-чарты (например, `JNandez Preflop Chart.xlsx`) не вшиты в установщик. После запуска нажмите **⚙ Pack & Settings** и укажите папку с вашим локальным паком.
+          > **Примечание о префлоп-чартах**: Покупные префлоп-чарты (например, \`JNandez Preflop Chart.xlsx\`) не вшиты в установщик. После запуска нажмите **⚙ Pack & Settings** и укажите папку с вашим локальным паком.
+          >
+          > **Лицензия и исходный код (GNU AGPL-3.0-only)**: Полный соответствующий исходный код этого релиза доступен в репозитории \`$REPO\` по тегу \`$TAG\` (см. \`LICENSE\` и \`NOTICE\`). При распространении бинарных сборок или предоставлении сетевого доступа к модифицированной версии необходимо предоставлять полный исходный код на условиях GNU AGPL v3.
           EOF
           )"
           fi

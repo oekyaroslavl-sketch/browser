@@ -98,8 +98,13 @@ struct SeatEntry {
     pos_label: String, // "BTN", "SB", "BB", "UTG", "MP", "CO"
 }
 
+const MAX_HH_INPUT_BYTES: usize = 2 * 1024 * 1024;
+
 /// Parses a PokerStars / GGPoker / CoinPoker 4-card Pot-Limit Omaha hand history text.
 pub fn parse_plo4_hand_history(raw: &str) -> Result<ParsedHandHistory, String> {
+    if raw.len() > MAX_HH_INPUT_BYTES {
+        return Err("Hand history text exceeds 2 MiB safety limit".to_string());
+    }
     let text = raw.trim();
     if text.is_empty() {
         return Err("Hand history text is empty".to_string());
@@ -219,6 +224,8 @@ pub fn parse_plo4_hand_history(raw: &str) -> Result<ParsedHandHistory, String> {
     let mut sec = Section::Header;
     let mut preflop_invested: std::collections::HashMap<String, f64> =
         std::collections::HashMap::new();
+    let mut preflop_antes: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
     let mut preflop_raises: Vec<String> = Vec::new();
     let mut preflop_calls: Vec<String> = Vec::new();
     let mut folded_preflop: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -268,16 +275,23 @@ pub fn parse_plo4_hand_history(raw: &str) -> Result<ParsedHandHistory, String> {
 
         // Blinds / Antes before `*** HOLE CARDS ***` or inside Header/Preflop
         if matches!(sec, Section::Header | Section::Preflop) {
-            if let Some((actor, amt, is_uncalled)) = parse_money_contribution(l, &seats) {
+            if let Some((actor, amt, is_uncalled, is_blind_or_ante)) =
+                parse_money_contribution(l, &seats)
+            {
                 if is_uncalled {
                     let cur = preflop_invested.entry(actor).or_insert(0.0);
                     *cur = (*cur - amt).max(0.0);
                 } else if l.contains("raises ") && l.contains(" to ") {
-                    // `raises $2 to $3` sets the player's street investment to `to $3`
-                    preflop_invested.insert(actor.clone(), amt);
+                    // `raises $2 to $3` sets the player's street investment to `to $3`,
+                    // while preserving any pre-posted ante (`posts the ante`) that is not part of the blind/bet level.
+                    let prev_ante = preflop_antes.get(&actor).copied().unwrap_or(0.0);
+                    preflop_invested.insert(actor.clone(), prev_ante + amt);
                     preflop_raises.push(actor);
                 } else {
                     *preflop_invested.entry(actor.clone()).or_insert(0.0) += amt;
+                    if is_blind_or_ante && l.to_ascii_lowercase().contains("ante") {
+                        *preflop_antes.entry(actor.clone()).or_insert(0.0) += amt;
+                    }
                     if sec == Section::Preflop && l.contains(": calls ") {
                         preflop_calls.push(actor);
                     }
@@ -300,55 +314,57 @@ pub fn parse_plo4_hand_history(raw: &str) -> Result<ParsedHandHistory, String> {
                     Section::River => "River",
                     _ => "",
                 };
-                if let Some(colon) = l.find(':') {
-                    let act_desc = l[colon + 1..].trim();
-                    if act_desc.starts_with("checks") {
-                        postflop_notes.push(format!("{street_tag}: {actor} {act_desc}"));
-                        raw_postflop_acts.push((
-                            street_tag.to_string(),
-                            actor,
-                            "check".to_string(),
-                            0.0,
-                        ));
-                    } else if act_desc.starts_with("folds") {
-                        postflop_notes.push(format!("{street_tag}: {actor} {act_desc}"));
-                        raw_postflop_acts.push((
-                            street_tag.to_string(),
-                            actor,
-                            "fold".to_string(),
-                            0.0,
-                        ));
-                    } else if act_desc.starts_with("calls") {
-                        let amt = parse_last_number(act_desc).unwrap_or(0.0);
-                        postflop_notes.push(format!("{street_tag}: {actor} {act_desc}"));
-                        raw_postflop_acts.push((
-                            street_tag.to_string(),
-                            actor,
-                            "call".to_string(),
-                            amt,
-                        ));
-                    } else if act_desc.starts_with("bets") {
-                        let amt = parse_last_number(act_desc).unwrap_or(0.0);
-                        postflop_notes.push(format!("{street_tag}: {actor} {act_desc}"));
-                        raw_postflop_acts.push((
-                            street_tag.to_string(),
-                            actor,
-                            "bet".to_string(),
-                            amt,
-                        ));
-                    } else if act_desc.starts_with("raises") {
-                        let amt = if let Some(ti) = act_desc.find(" to ") {
-                            parse_first_number(&act_desc[ti + 4..]).unwrap_or(0.0)
-                        } else {
-                            parse_last_number(act_desc).unwrap_or(0.0)
-                        };
-                        postflop_notes.push(format!("{street_tag}: {actor} {act_desc}"));
-                        raw_postflop_acts.push((
-                            street_tag.to_string(),
-                            actor,
-                            "raise".to_string(),
-                            amt,
-                        ));
+                if let Some(after_actor) = l.strip_prefix(&actor) {
+                    if let Some(act_raw) = after_actor.trim_start().strip_prefix(':') {
+                        let act_desc = act_raw.trim();
+                        if act_desc.starts_with("checks") {
+                            postflop_notes.push(format!("{street_tag}: {actor} {act_desc}"));
+                            raw_postflop_acts.push((
+                                street_tag.to_string(),
+                                actor,
+                                "check".to_string(),
+                                0.0,
+                            ));
+                        } else if act_desc.starts_with("folds") {
+                            postflop_notes.push(format!("{street_tag}: {actor} {act_desc}"));
+                            raw_postflop_acts.push((
+                                street_tag.to_string(),
+                                actor,
+                                "fold".to_string(),
+                                0.0,
+                            ));
+                        } else if act_desc.starts_with("calls") {
+                            let amt = parse_money_before_all_in(act_desc).unwrap_or(0.0);
+                            postflop_notes.push(format!("{street_tag}: {actor} {act_desc}"));
+                            raw_postflop_acts.push((
+                                street_tag.to_string(),
+                                actor,
+                                "call".to_string(),
+                                amt,
+                            ));
+                        } else if act_desc.starts_with("bets") {
+                            let amt = parse_money_before_all_in(act_desc).unwrap_or(0.0);
+                            postflop_notes.push(format!("{street_tag}: {actor} {act_desc}"));
+                            raw_postflop_acts.push((
+                                street_tag.to_string(),
+                                actor,
+                                "bet".to_string(),
+                                amt,
+                            ));
+                        } else if act_desc.starts_with("raises") {
+                            let amt = if let Some(ti) = act_desc.find(" to ") {
+                                parse_first_number(&act_desc[ti + 4..]).unwrap_or(0.0)
+                            } else {
+                                parse_money_before_all_in(act_desc).unwrap_or(0.0)
+                            };
+                            postflop_notes.push(format!("{street_tag}: {actor} {act_desc}"));
+                            raw_postflop_acts.push((
+                                street_tag.to_string(),
+                                actor,
+                                "raise".to_string(),
+                                amt,
+                            ));
+                        }
                     }
                 }
             }
@@ -656,31 +672,45 @@ fn match_known_player_prefix(line: &str, seats: &[SeatEntry]) -> Option<String> 
     None
 }
 
-fn parse_money_contribution(line: &str, seats: &[SeatEntry]) -> Option<(String, f64, bool)> {
+fn parse_money_contribution(line: &str, seats: &[SeatEntry]) -> Option<(String, f64, bool, bool)> {
     // Handle `Uncalled bet ($2.00) returned to PlayerName`
     if line.starts_with("Uncalled bet") {
         if let Some(ret_idx) = line.find("returned to ") {
             let player = line[ret_idx + "returned to ".len()..].trim().to_string();
             let amt = parse_first_number(line)?;
-            return Some((player, amt, true));
+            return Some((player, amt, true, false));
         }
     }
 
     let actor = match_known_player_prefix(line, seats)?;
-    let colon = line.find(':')?;
-    let act = line[colon + 1..].trim();
+    // Use `actor.len()` (or the colon right after `actor`) so player names containing `:` work cleanly!
+    let after_actor = line.strip_prefix(&actor)?.trim_start();
+    let act = after_actor.strip_prefix(':')?.trim();
 
-    if act.starts_with("posts ") || act.starts_with("calls ") || act.starts_with("bets ") {
-        let amt = parse_last_number(act)?;
-        return Some((actor, amt, false));
+    if act.starts_with("posts ") {
+        let amt = parse_money_before_all_in(act)?;
+        return Some((actor, amt, false, true));
+    }
+    if act.starts_with("calls ") || act.starts_with("bets ") {
+        let amt = parse_money_before_all_in(act)?;
+        return Some((actor, amt, false, false));
     }
     if act.starts_with("raises ") {
         if let Some(to_idx) = act.find(" to ") {
             let amt = parse_first_number(&act[to_idx + 4..])?;
-            return Some((actor, amt, false));
+            return Some((actor, amt, false, false));
         }
     }
     None
+}
+
+fn parse_money_before_all_in(act: &str) -> Option<f64> {
+    let trimmed = if let Some(ai) = act.find(" and is all-in") {
+        &act[..ai]
+    } else {
+        act
+    };
+    parse_last_number(trimmed)
 }
 
 fn parse_first_number(s: &str) -> Option<f64> {

@@ -556,12 +556,12 @@ impl ActionTree {
             actions.push(Action::Check);
 
             if self.config.max_bets_per_street == 0 || state.num_bets < self.config.max_bets_per_street {
-                let min_bet = self.config.min_bet_unit.min(street_max);
                 // POT-LIMIT INVARIANT: Max opening bet in PLO is 100% of current pot (capped by stack)!
                 let max_legal_to = match self.config.betting_limit {
                     BettingLimit::PotLimit => pot_street_start.min(street_max),
                     BettingLimit::NoLimitApprox => street_max,
                 };
+                let min_bet = self.config.min_bet_unit.min(max_legal_to);
 
                 let fracs = if player == PLAYER_OOP && state.oop_called_prev_street {
                     sizes.donk_fractions.as_ref().unwrap_or(&sizes.bet_fractions)
@@ -621,14 +621,14 @@ impl ActionTree {
 
             if can_raise {
                 let pot_after_call = pot_street_start + 2 * opp_inv;
-                let min_raise_to =
-                    (opp_inv + state.last_raise_inc.max(self.config.min_bet_unit)).min(street_max);
 
                 // POT-LIMIT INVARIANT: Max raise-to on street is `opp_inv + pot_after_call` (capped by stack)!
                 let max_legal_to = match self.config.betting_limit {
                     BettingLimit::PotLimit => (opp_inv.saturating_add(pot_after_call)).min(street_max),
                     BettingLimit::NoLimitApprox => street_max,
                 };
+                let min_raise_to =
+                    (opp_inv + state.last_raise_inc.max(self.config.min_bet_unit)).min(max_legal_to);
 
                 for &f in &sizes.raise_fractions {
                     let eff_f = match self.config.betting_limit {
@@ -1140,5 +1140,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn min_bet_unit_exceeding_starting_pot_never_panics_and_caps_at_pot() {
+        let sz = StreetBetSizes {
+            bet_fractions: vec![0.5, 1.0],
+            raise_fractions: vec![1.0],
+            donk_fractions: None,
+        };
+        let tree = ActionTree::build(TreeConfig {
+            initial_street: Street::River,
+            starting_pot: 10,
+            effective_stack: 100,
+            min_bet_unit: 50,
+            river_sizes: [sz.clone(), sz],
+            ..Default::default()
+        })
+        .expect("valid tree even when min_bet_unit > starting_pot");
+        let ActionNodeKind::Player { actions, .. } = &tree.node(tree.root_id()).kind else {
+            panic!("expected root player node");
+        };
+        assert_eq!(actions, &[Action::Check, Action::Bet(10)]);
     }
 }

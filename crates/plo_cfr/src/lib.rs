@@ -26,7 +26,7 @@ use plo_cards::{
 use plo_eval::{eval_plo, RiverBoardCache};
 use plo_iso::{
     build_combo_swap_pairs, compute_chance_isomorphism, permute_board, permute_card, permute_hand4,
-    suit_transposition,
+    suit_transposition, ChanceIsomorphism,
 };
 use plo_range::{per_combo_river_equity, PloRange, RangeError, WeightedHand};
 use plo_tree::{Action, ActionNodeKind, ActionTree, TreeConfig, TreeError, PLAYER_IP, PLAYER_OOP};
@@ -801,24 +801,49 @@ std::thread_local! {
     static IN_PARALLEL_CHANCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+std::thread_local! {
+    static TLS_IE_SCRATCH_POOL: std::cell::RefCell<Vec<InclusionExclusionScratch>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Executes `f` with a reusable thread-local [`InclusionExclusionScratch`] (`~183 KiB`),
+/// eliminating thousands of per-chance-branch `mmap`/`munmap` allocations during Flop/Turn solves.
+#[inline]
+fn with_tls_ie_scratch<R>(f: impl FnOnce(&mut InclusionExclusionScratch) -> R) -> R {
+    let mut scratch = TLS_IE_SCRATCH_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_else(InclusionExclusionScratch::new);
+    let res = f(&mut scratch);
+    TLS_IE_SCRATCH_POOL.with(|pool| {
+        let mut p = pool.borrow_mut();
+        if p.len() < 4 {
+            p.push(scratch);
+        }
+    });
+    res
+}
+
 /// Zero-dependency native `std::thread::scope` parallel mapper over `(rep_cards, rep_children)`.
 /// Parallelizes top-level chance nodes across up to `native_solver_threads()` worker threads without
-/// nested thread oversubscription (`Turn->River` inside `Flop->Turn` runs inline on each worker thread!).
+/// nested thread oversubscription (`Turn->River` inside `Flop->Turn` runs inline on each worker thread!),
+/// passing one reusable [`InclusionExclusionScratch`] per worker thread across all branches in its chunk!
 #[cfg(not(target_arch = "wasm32"))]
 fn map_chance_branches<T, F>(rep_cards: &[Card], rep_children: &[usize], f: F) -> Vec<T>
 where
     T: Send,
-    F: Fn(Card, usize) -> T + Sync,
+    F: Fn(Card, usize, &mut InclusionExclusionScratch) -> T + Sync,
 {
     let n = rep_cards.len();
     let n_threads = native_solver_threads();
     let already_par = IN_PARALLEL_CHANCE.with(|c| c.get());
     if n <= 2 || n_threads <= 1 || already_par {
-        return rep_cards
-            .iter()
-            .zip(rep_children.iter())
-            .map(|(&card, &cid)| f(card, cid))
-            .collect();
+        return with_tls_ie_scratch(|scratch| {
+            rep_cards
+                .iter()
+                .zip(rep_children.iter())
+                .map(|(&card, &cid)| f(card, cid, scratch))
+                .collect()
+        });
     }
 
     let workers = n_threads.min(n);
@@ -831,11 +856,13 @@ where
         {
             handles.push(s.spawn(move || {
                 IN_PARALLEL_CHANCE.with(|cell| cell.set(true));
-                let res: Vec<T> = c_chunk
-                    .iter()
-                    .zip(id_chunk.iter())
-                    .map(|(&card, &cid)| f_ref(card, cid))
-                    .collect();
+                let res: Vec<T> = with_tls_ie_scratch(|scratch| {
+                    c_chunk
+                        .iter()
+                        .zip(id_chunk.iter())
+                        .map(|(&card, &cid)| f_ref(card, cid, scratch))
+                        .collect()
+                });
                 IN_PARALLEL_CHANCE.with(|cell| cell.set(false));
                 res
             }));
@@ -903,8 +930,12 @@ struct ConcreteNode {
     kind: ConcreteNodeKind,
 }
 
-/// Discounted CFR schedule matching `b-inary/postflop-solver` (`alpha = 1.5, beta = 0.5, gamma = 3.0`
-/// with power-of-4 cumulative strategy resets).
+/// Discounted CFR parameter schedule: a variant in the spirit of Brown & Sandholm (AAAI 2019,
+/// arXiv:1809.04040) `DCFR(3/2, 0, 2)`, using:
+/// - `alpha_t = t^{3/2} / (t^{3/2} + 1)` on positive cumulative regrets,
+/// - `beta = 0` (CFR+-style zeroing of negative cumulative regrets), and
+/// - multiplicative cumulative-strategy step discount `gamma_t = ((t - 1) / t)^2`, which yields
+///   an exact quadratic `(t / T)^2` weight profile across iterations `t = 1..=T` (no power-of-4 resets).
 #[derive(Clone, Copy)]
 struct DcfrParams {
     alpha: f32,
@@ -913,11 +944,10 @@ struct DcfrParams {
 }
 
 impl DcfrParams {
-    /// Standard Brown & Sandholm (AAAI 2019) Discounted CFR (`DCFR(3/2, 0, 2)`):
-    /// - `t = iter + 1` (`1, 2, 3, ...`)
+    /// Computes per-iteration discount factors (`t = iter + 1` in `1, 2, 3, ...`):
     /// - `alpha_t = t^{1.5} / (t^{1.5} + 1)`
-    /// - `beta_t = 0.0` (CFR+ / DCFR zeroing of negative regrets for rapid convergence)
-    /// - `gamma_t = ((t - 1) / t)^2`
+    /// - `beta_t = 0.0` (zeroes negative cumulative regrets)
+    /// - `gamma_t = ((t - 1) / t)^2` (gives iteration `t` final weight `(t / T)^2` after `T` steps)
     fn for_iteration(iter: u32) -> Self {
         let t = (iter + 1) as f64;
         let pow_alpha = t * t.sqrt();
@@ -1068,14 +1098,26 @@ impl PloGame {
             });
         }
 
-        // Remove root-board-blocked combos immediately
+        // Remove root-board-blocked and zero-weight combos immediately (`w > 0.0` strictly)
         let live_oop = oop_range.without_dead(board.mask());
         let live_ip = ip_range.without_dead(board.mask());
-        if live_oop.is_empty() || live_ip.is_empty() {
+        let combos = [
+            live_oop
+                .entries()
+                .iter()
+                .copied()
+                .filter(|c| c.weight > 0.0)
+                .collect::<Vec<_>>(),
+            live_ip
+                .entries()
+                .iter()
+                .copied()
+                .filter(|c| c.weight > 0.0)
+                .collect::<Vec<_>>(),
+        ];
+        if combos[0].is_empty() || combos[1].is_empty() {
             return Err(SolverError::Range(RangeError::EmptyRange));
         }
-
-        let combos = [live_oop.entries().to_vec(), live_ip.entries().to_vec()];
         let n_oop = combos[0].len();
         let n_ip = combos[1].len();
         let combo_ids = [
@@ -1113,6 +1155,13 @@ impl PloGame {
 
         let effective_iso = options.enable_chance_isomorphism && abstraction.is_suit_symmetric();
 
+        let oop_iso_vec: Vec<(ComboId, f32)> =
+            combos[0].iter().map(|c| (c.combo_id, c.weight)).collect();
+        let ip_iso_vec: Vec<(ComboId, f32)> =
+            combos[1].iter().map(|c| (c.combo_id, c.weight)).collect();
+        let mut iso_cache: std::collections::HashMap<u64, ChanceIsomorphism> =
+            std::collections::HashMap::new();
+
         // Estimate concrete memory BEFORE allocating giant Flop/Turn arrays!
         let est = estimate_tree_memory(
             &board,
@@ -1121,6 +1170,9 @@ impl PloGame {
             action_tree,
             abstraction,
             effective_iso,
+            &oop_iso_vec,
+            &ip_iso_vec,
+            &mut iso_cache,
         );
         if est.total_estimated_bytes > options.max_memory_bytes {
             let avg_b = (combos[0].len() + combos[1].len()) / 2;
@@ -1135,8 +1187,9 @@ impl PloGame {
         let mut builder = ConcreteBuilder {
             combos: &combos,
             combo_ids: &combo_ids,
-            oop_iso_vec: live_oop.to_combo_weight_vec(),
-            ip_iso_vec: live_ip.to_combo_weight_vec(),
+            oop_iso_vec,
+            ip_iso_vec,
+            iso_cache,
             action_tree,
             abstraction,
             enable_iso: effective_iso,
@@ -1191,7 +1244,7 @@ impl PloGame {
             total_estimated_bytes: regret_strat_bytes
                 + bucket_map_bytes
                 + river_eval_bytes
-                + (nodes.len() as u64) * 96,
+                + (nodes.len() as u64) * 192,
         };
 
         Ok(Self {
@@ -1253,20 +1306,28 @@ impl PloGame {
     /// Runs a single Discounted CFR iteration (`OOP` update followed by `IP` update).
     pub fn solve_step(&mut self) {
         let params = DcfrParams::for_iteration(self.iterations_run);
-        let mut scratch = InclusionExclusionScratch::new();
 
-        for player in [PLAYER_OOP, PLAYER_IP] {
-            let opp = player ^ 1;
-            let my_reach = self.initial_weights[player].clone();
-            let opp_reach = self.initial_weights[opp].clone();
-            let _ = self.dcfr_traverse(0, player, &my_reach, &opp_reach, &params, &mut scratch);
-        }
+        with_tls_ie_scratch(|scratch| {
+            for player in [PLAYER_OOP, PLAYER_IP] {
+                let opp = player ^ 1;
+                let _ = self.dcfr_traverse(
+                    0,
+                    player,
+                    &self.initial_weights[player],
+                    &self.initial_weights[opp],
+                    &params,
+                    scratch,
+                );
+            }
+        });
 
         self.iterations_run += 1;
     }
 
     /// Runs up to `max_iterations` of DCFR, stopping early if exploitability (in chip units)
-    /// drops to or below `target_exploitability`. Returns final exploitability in chips.
+    /// drops to or below `target_exploitability` (checked every `25` iterations and at completion
+    /// to amortize full best-response traversal cost; use [`Self::solve_with_hooks`] for a custom check stride).
+    /// Returns final exploitability in chips.
     pub fn solve(&mut self, max_iterations: u32, target_exploitability: f32) -> f32 {
         let mut expl = self.exploitability();
         for i in 0..max_iterations {
@@ -1340,24 +1401,25 @@ impl PloGame {
     /// Note: Even when `HandAbstraction` buckets decision strategies, `exploitability()` computes the
     /// **exact unabstracted combo-level best response** against the induced strategy!
     pub fn exploitability(&self) -> f32 {
-        let mut scratch = InclusionExclusionScratch::new();
         let mut mes_sum = [0.0f64; 2];
+        with_tls_ie_scratch(|scratch| {
+            for player in [PLAYER_OOP, PLAYER_IP] {
+                let opp = player ^ 1;
+                let best_cfv =
+                    self.best_response_traverse(0, player, &self.initial_weights[opp], scratch);
+                mes_sum[player] = best_cfv
+                    .iter()
+                    .zip(&self.initial_weights[player])
+                    .map(|(&v, &w)| (v as f64) * (w as f64))
+                    .sum();
+            }
+        });
 
-        for player in [PLAYER_OOP, PLAYER_IP] {
-            let opp = player ^ 1;
-            let best_cfv =
-                self.best_response_traverse(0, player, &self.initial_weights[opp], &mut scratch);
-            mes_sum[player] = best_cfv
-                .iter()
-                .zip(&self.initial_weights[player])
-                .map(|(&v, &w)| (v as f64) * (w as f64))
-                .sum();
-        }
-
-        // Since payoffs are zero-sum centered around 0.5 * starting_pot and divided by valid_root_pair_weight,
-        // `mes_sum[0] + mes_sum[1] >= 0`, and `0.5 * (mes_sum[0] + mes_sum[1])` is exact exploitability per hand!
-        // When `rake_fraction > 0` or nodes are locked, subtract current `(EV_OOP + EV_IP - pot)` so dEV remains
-        // exact Nash distance `0.5 * ((BR_OOP - EV_OOP) + (BR_IP - EV_IP))`.
+        // Since zero-rake payoffs are strictly zero-sum (`EV_OOP + EV_IP == starting_pot`, even when
+        // nodes are locked), centered `mes_sum[0] + mes_sum[1] == (BR_OOP - 0.5*pot) + (BR_IP - 0.5*pot)
+        // == (BR_OOP + BR_IP) - (EV_OOP + EV_IP) >= 0`, so `0.5 * (mes_sum[0] + mes_sum[1])` is exact
+        // Nash distance! When `rake_fraction > 0`, `EV_OOP + EV_IP < starting_pot`, so we subtract
+        // `(EV_OOP, EV_IP)` explicitly to preserve `0.5 * ((BR_OOP - EV_OOP) + (BR_IP - EV_IP))`.
         if self.rake_fraction > 0.0 {
             let [ev_oop, ev_ip] = self.root_expected_values();
             let half_pot = 0.5 * (self.tree_config.starting_pot as f64);
@@ -1372,21 +1434,22 @@ impl PloGame {
     /// Computes exact best-response expected values `[BR_OOP, BR_IP]` in chip units against the frozen
     /// average strategy (`BR_p >= EV_p`, and `0.5 * ((BR_OOP - EV_OOP) + (BR_IP - EV_IP)) == exploitability()`).
     pub fn best_response_values_f64(&self) -> [f64; 2] {
-        let mut scratch = InclusionExclusionScratch::new();
         let half_pot = 0.5 * (self.tree_config.starting_pot as f64);
         let mut br = [0.0f64; 2];
 
-        for player in [PLAYER_OOP, PLAYER_IP] {
-            let opp = player ^ 1;
-            let best_cfv =
-                self.best_response_traverse(0, player, &self.initial_weights[opp], &mut scratch);
-            let mes_centered: f64 = best_cfv
-                .iter()
-                .zip(&self.initial_weights[player])
-                .map(|(&v, &w)| (v as f64) * (w as f64))
-                .sum();
-            br[player] = half_pot + mes_centered;
-        }
+        with_tls_ie_scratch(|scratch| {
+            for player in [PLAYER_OOP, PLAYER_IP] {
+                let opp = player ^ 1;
+                let best_cfv =
+                    self.best_response_traverse(0, player, &self.initial_weights[opp], scratch);
+                let mes_centered: f64 = best_cfv
+                    .iter()
+                    .zip(&self.initial_weights[player])
+                    .map(|(&v, &w)| (v as f64) * (w as f64))
+                    .sum();
+                br[player] = half_pot + mes_centered;
+            }
+        });
         br
     }
 
@@ -1405,21 +1468,22 @@ impl PloGame {
     /// Computes expected game values `[EV_OOP, EV_IP]` at the root under the current average strategy
     /// in full `f64` double precision (`EV_OOP + EV_IP == starting_pot` to `~1e-13`).
     pub fn root_expected_values_f64(&self) -> [f64; 2] {
-        let mut scratch = InclusionExclusionScratch::new();
         let mut centered = [0.0f64; 2];
-        for player in [PLAYER_OOP, PLAYER_IP] {
-            let opp = player ^ 1;
-            let init_opp_f64: Vec<f64> = self.initial_weights[opp]
-                .iter()
-                .map(|&w| w as f64)
-                .collect();
-            let cfv = self.strategy_cfv_traverse_f64(0, player, &init_opp_f64, &mut scratch);
-            centered[player] = cfv
-                .iter()
-                .zip(&self.initial_weights[player])
-                .map(|(&v, &w)| v * (w as f64))
-                .sum();
-        }
+        with_tls_ie_scratch(|scratch| {
+            for player in [PLAYER_OOP, PLAYER_IP] {
+                let opp = player ^ 1;
+                let init_opp_f64: Vec<f64> = self.initial_weights[opp]
+                    .iter()
+                    .map(|&w| w as f64)
+                    .collect();
+                let cfv = self.strategy_cfv_traverse_f64(0, player, &init_opp_f64, scratch);
+                centered[player] = cfv
+                    .iter()
+                    .zip(&self.initial_weights[player])
+                    .map(|(&v, &w)| v * (w as f64))
+                    .sum();
+            }
+        });
         let half_start = 0.5 * (self.tree_config.starting_pot as f64);
         [half_start + centered[0], half_start + centered[1]]
     }
@@ -2222,12 +2286,67 @@ impl PloGame {
         Ok(())
     }
 
+    /// Deterministic 64-bit FNV-1a structural & range fingerprint of this [`PloGame`] instance,
+    /// used by `PLOSNAP2` binary snapshots to prevent loading weights from a mismatched spot!
+    fn structural_config_hash(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |bytes: &[u8]| {
+            for &b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        mix(&self.root_board.mask().bits().to_le_bytes());
+        mix(&self.tree_config.starting_pot.to_le_bytes());
+        mix(&self.tree_config.effective_stack.to_le_bytes());
+        mix(&self.rake_fraction.to_bits().to_le_bytes());
+        mix(&self.rake_cap_chips.to_bits().to_le_bytes());
+        mix(&[self.enable_chance_isomorphism as u8]);
+        for p in 0..2 {
+            mix(&(self.combos[p].len() as u32).to_le_bytes());
+            for c in &self.combos[p] {
+                mix(&c.combo_id.raw().to_le_bytes());
+                mix(&c.weight.to_bits().to_le_bytes());
+            }
+        }
+        mix(&(self.nodes.len() as u32).to_le_bytes());
+        for node in &self.nodes {
+            mix(&node.board.mask().bits().to_le_bytes());
+            mix(&node.committed[0].to_le_bytes());
+            mix(&node.committed[1].to_le_bytes());
+            match &node.kind {
+                ConcreteNodeKind::Player {
+                    player,
+                    actions,
+                    num_buckets,
+                    ..
+                } => {
+                    mix(&[1u8, *player as u8]);
+                    mix(&(*num_buckets as u32).to_le_bytes());
+                    mix(&(actions.len() as u32).to_le_bytes());
+                }
+                ConcreteNodeKind::Chance { rep_cards, .. } => {
+                    mix(&[2u8]);
+                    mix(&(rep_cards.len() as u32).to_le_bytes());
+                }
+                ConcreteNodeKind::TerminalFold { folded_player, .. } => {
+                    mix(&[3u8, *folded_player as u8]);
+                }
+                ConcreteNodeKind::TerminalShowdown { .. } => {
+                    mix(&[4u8]);
+                }
+            }
+        }
+        h
+    }
+
     /// Exports all learned solver weights (`iterations_run` plus every `Player` node's `regrets`, `cum_strategy`,
-    /// and optional `locked_strategy`) as a compact binary byte vector (`PLOSNAP1` magic header) so a solved tree
-    /// can be saved to disk and restored in milliseconds without re-running DCFR (`#5` Binary Tree Snapshot)!
+    /// and optional `locked_strategy`) as a compact binary byte vector (`PLOSNAP2` magic header + 64-bit structural
+    /// config hash) so a solved tree can be saved to disk and restored in milliseconds without re-running DCFR!
     pub fn export_weights_binary(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(b"PLOSNAP1");
+        out.extend_from_slice(b"PLOSNAP2");
+        out.extend_from_slice(&self.structural_config_hash().to_le_bytes());
         out.extend_from_slice(&self.iterations_run.to_le_bytes());
         let n_nodes = self.nodes.len() as u32;
         out.extend_from_slice(&n_nodes.to_le_bytes());
@@ -2269,11 +2388,17 @@ impl PloGame {
     }
 
     /// Restores learned solver weights previously exported via [`PloGame::export_weights_binary`] into an
-    /// identically structured `PloGame` (`#5` Binary Tree Snapshot)!
+    /// identically structured `PloGame` (`PLOSNAP2` format; explicitly rejects legacy `PLOSNAP1`, mismatched
+    /// structural hashes, and any `NaN`/`Inf` floats without mutating `self` on error)!
     pub fn import_weights_binary(&mut self, bytes: &[u8]) -> Result<(), SolverError> {
-        if bytes.len() < 16 || &bytes[0..8] != b"PLOSNAP1" {
+        if bytes.len() >= 8 && &bytes[0..8] == b"PLOSNAP1" {
             return Err(SolverError::InvalidHistoryStep(
-                "Invalid .plotree binary header (expected PLOSNAP1)".to_string(),
+                "Legacy PLOSNAP1 snapshot is incompatible with v0.1.1+ (expected PLOSNAP2 with config hash); please re-save the spot".to_string(),
+            ));
+        }
+        if bytes.len() < 24 || &bytes[0..8] != b"PLOSNAP2" {
+            return Err(SolverError::InvalidHistoryStep(
+                "Invalid .plotree binary header (expected PLOSNAP2)".to_string(),
             ));
         }
         let mut pos = 8usize;
@@ -2287,7 +2412,18 @@ impl PloGame {
             *p += 4;
             Ok(v)
         };
-        let read_f32 = |buf: &[u8], p: &mut usize| -> Result<f32, SolverError> {
+        let read_u64 = |buf: &[u8], p: &mut usize| -> Result<u64, SolverError> {
+            if *p + 8 > buf.len() {
+                return Err(SolverError::InvalidHistoryStep(
+                    "Truncated .plotree config hash".to_string(),
+                ));
+            }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&buf[*p..*p + 8]);
+            *p += 8;
+            Ok(u64::from_le_bytes(arr))
+        };
+        let read_finite_f32 = |buf: &[u8], p: &mut usize| -> Result<f32, SolverError> {
             if *p + 4 > buf.len() {
                 return Err(SolverError::InvalidHistoryStep(
                     "Truncated .plotree f32 array".to_string(),
@@ -2295,8 +2431,22 @@ impl PloGame {
             }
             let v = f32::from_le_bytes([buf[*p], buf[*p + 1], buf[*p + 2], buf[*p + 3]]);
             *p += 4;
+            if !v.is_finite() {
+                return Err(SolverError::InvalidHistoryStep(
+                    "Corrupted .plotree snapshot: non-finite (NaN/Inf) weight encountered"
+                        .to_string(),
+                ));
+            }
             Ok(v)
         };
+
+        let snap_hash = read_u64(bytes, &mut pos)?;
+        let expected_hash = self.structural_config_hash();
+        if snap_hash != expected_hash {
+            return Err(SolverError::InvalidHistoryStep(format!(
+                "Snapshot configuration hash mismatch ({snap_hash:#018x} != {expected_hash:#018x}): snapshot belongs to a different board, range, or tree"
+            )));
+        }
 
         let iters = read_u32(bytes, &mut pos)?;
         let n_nodes = read_u32(bytes, &mut pos)? as usize;
@@ -2307,7 +2457,15 @@ impl PloGame {
             )));
         }
 
-        for node in &mut self.nodes {
+        // Parse & validate all buffers into staging storage first so `self` is never half-mutated on error
+        struct StagedPlayerWeights {
+            regrets: Vec<f32>,
+            cum_strategy: Vec<f32>,
+            locked_strategy: Option<Vec<f32>>,
+        }
+        let mut staged: Vec<Option<StagedPlayerWeights>> = Vec::with_capacity(n_nodes);
+
+        for node in &self.nodes {
             if pos >= bytes.len() {
                 return Err(SolverError::InvalidHistoryStep(
                     "Truncated .plotree node stream".to_string(),
@@ -2315,28 +2473,38 @@ impl PloGame {
             }
             let marker = bytes[pos];
             pos += 1;
-            match (&mut node.kind, marker) {
+            match (&node.kind, marker) {
                 (
                     ConcreteNodeKind::Player {
+                        actions,
+                        num_buckets,
                         storage,
-                        locked_strategy,
                         ..
                     },
                     1u8,
                 ) => {
                     let len = read_u32(bytes, &mut pos)? as usize;
-                    let st = storage.as_mut();
+                    let st = storage.as_ref();
                     if st.regrets.len() != len {
                         return Err(SolverError::InvalidHistoryStep(format!(
                             "Player storage length mismatch: snapshot has {len}, game has {}",
                             st.regrets.len()
                         )));
                     }
-                    for r in &mut st.regrets {
-                        *r = read_f32(bytes, &mut pos)?;
+                    let mut regs = Vec::with_capacity(len);
+                    for _ in 0..len {
+                        regs.push(read_finite_f32(bytes, &mut pos)?);
                     }
-                    for c in &mut st.cum_strategy {
-                        *c = read_f32(bytes, &mut pos)?;
+                    let mut cums = Vec::with_capacity(len);
+                    for _ in 0..len {
+                        let c = read_finite_f32(bytes, &mut pos)?;
+                        if c < 0.0 {
+                            return Err(SolverError::InvalidHistoryStep(
+                                "Corrupted .plotree snapshot: negative cumulative strategy weight"
+                                    .to_string(),
+                            ));
+                        }
+                        cums.push(c);
                     }
                     if pos >= bytes.len() {
                         return Err(SolverError::InvalidHistoryStep(
@@ -2345,29 +2513,71 @@ impl PloGame {
                     }
                     let has_lock = bytes[pos];
                     pos += 1;
-                    if has_lock == 1u8 {
+                    let lock_opt = if has_lock == 1u8 {
                         let llen = read_u32(bytes, &mut pos)? as usize;
+                        let expected_llen = actions.len() * (*num_buckets);
+                        if llen != expected_llen {
+                            return Err(SolverError::InvalidHistoryStep(format!(
+                                "Locked strategy length mismatch: snapshot has {llen}, expected {expected_llen}"
+                            )));
+                        }
                         let mut ls = Vec::with_capacity(llen);
                         for _ in 0..llen {
-                            ls.push(read_f32(bytes, &mut pos)?);
+                            let p = read_finite_f32(bytes, &mut pos)?;
+                            if !(0.0..=1.0001).contains(&p) {
+                                return Err(SolverError::InvalidHistoryStep(
+                                    "Corrupted .plotree snapshot: locked probability outside [0, 1]"
+                                        .to_string(),
+                                ));
+                            }
+                            ls.push(p);
                         }
-                        *locked_strategy = Some(ls);
+                        Some(ls)
+                    } else if has_lock == 0u8 {
+                        None
                     } else {
-                        *locked_strategy = None;
-                    }
+                        return Err(SolverError::InvalidHistoryStep(
+                            "Invalid lock flag in .plotree snapshot".to_string(),
+                        ));
+                    };
+                    staged.push(Some(StagedPlayerWeights {
+                        regrets: regs,
+                        cum_strategy: cums,
+                        locked_strategy: lock_opt,
+                    }));
                 }
                 (ConcreteNodeKind::Player { .. }, _) => {
                     return Err(SolverError::InvalidHistoryStep(
                         "Expected Player node marker in .plotree snapshot".to_string(),
                     ));
                 }
-                (_, 0u8) => {}
+                (_, 0u8) => {
+                    staged.push(None);
+                }
                 _ => {
                     return Err(SolverError::InvalidHistoryStep(
                         "Unexpected Player marker on non-player node in .plotree snapshot"
                             .to_string(),
                     ));
                 }
+            }
+        }
+
+        // Commit validated staging buffers atomically
+        for (node, entry) in self.nodes.iter_mut().zip(staged.into_iter()) {
+            if let (
+                ConcreteNodeKind::Player {
+                    storage,
+                    locked_strategy,
+                    ..
+                },
+                Some(sw),
+            ) = (&mut node.kind, entry)
+            {
+                let st = storage.as_mut();
+                st.regrets = sw.regrets;
+                st.cum_strategy = sw.cum_strategy;
+                *locked_strategy = sw.locked_strategy;
             }
         }
         self.iterations_run = iters;
@@ -2596,7 +2806,7 @@ impl PloGame {
 
                 #[cfg(not(target_arch = "wasm32"))]
                 let branch_cfvs: Vec<Vec<f32>> =
-                    map_chance_branches(rep_cards, rep_children, |card, child_id| {
+                    map_chance_branches(rep_cards, rep_children, |card, child_id, local_scratch| {
                         let cmask = card.mask();
                         let mut child_my_reach = vec![0.0f32; my_reach.len()];
                         for (i, &r) in my_reach.iter().enumerate() {
@@ -2610,14 +2820,13 @@ impl PloGame {
                                 child_reach[j] = r * inv_chance;
                             }
                         }
-                        let mut local_scratch = InclusionExclusionScratch::new();
                         let mut cfv = self.dcfr_traverse(
                             child_id,
                             player,
                             &child_my_reach,
                             &child_reach,
                             params,
-                            &mut local_scratch,
+                            local_scratch,
                         );
                         for (i, c) in self.combos[player].iter().enumerate() {
                             if c.mask.intersects(cmask) {
@@ -2752,11 +2961,24 @@ impl PloGame {
                         let board_mask = self.nodes[node_id].board.mask();
                         let bucketed = !combo_to_bucket.is_empty();
                         let mut my_bucket_reach = vec![0.0f32; num_buckets];
+                        let mut bucket_inv_norm = Vec::new();
                         if bucketed {
+                            let mut init_bucket_weight = vec![0.0f32; num_buckets];
                             for i in 0..n_hands {
                                 if !self.combos[player][i].mask.intersects(board_mask) {
-                                    my_bucket_reach[combo_to_bucket[i] as usize] += my_reach[i];
+                                    let b = combo_to_bucket[i] as usize;
+                                    my_bucket_reach[b] += my_reach[i];
+                                    init_bucket_weight[b] += self.initial_weights[player][i];
                                 }
+                            }
+                            bucket_inv_norm.resize(num_buckets, 0.0f32);
+                            for b in 0..num_buckets {
+                                let denom = if my_bucket_reach[b] > 0.0 {
+                                    my_bucket_reach[b]
+                                } else {
+                                    init_bucket_weight[b]
+                                };
+                                bucket_inv_norm[b] = if denom > 0.0 { 1.0f32 / denom } else { 0.0 };
                             }
                         } else {
                             for i in 0..n_hands {
@@ -2781,6 +3003,17 @@ impl PloGame {
                             }
                         }
 
+                        // Counterfactual regret update:
+                        // - In exact `Identity` mode (`!bucketed`), instantaneous counterfactual regret is
+                        //   unweighted by hero's own reach (`cfv_row[i] - node_cfv[i]`), matching classic CFR
+                        //   (Zinkevich et al., 2007) and upstream `b-inary/postflop-solver`.
+                        // - In `bucketed` mode (`k < N` or bijective `k >= N`), combos within bucket `b` are
+                        //   averaged by their normalized conditional composition `p(i | b) = my_reach[i] / my_bucket_reach[b]`
+                        //   (with normalized prior fallback `w0[i] / sum_{j in b} w0[j]` when `my_bucket_reach[b] == 0.0`,
+                        //   guarded against `denom == 0.0`), using a single division per bucket.
+                        //   Note: For lossy abstractions (`k < N`), `p(i | b)` evolves across iterations as earlier-street
+                        //   strategies change (imperfect recall has no general convergence theorem); in the bijective limit
+                        //   `k >= N`, `p(i | b) == 1.0` identically, recovering exact `Identity` updates!
                         for a in 0..n_actions {
                             let reg_row = &mut regrets[a * num_buckets..(a + 1) * num_buckets];
                             let cfv_row = &action_cfvs[a];
@@ -2800,7 +3033,8 @@ impl PloGame {
                                 for b in 0..num_buckets {
                                     let prev = reg_row[b];
                                     let coef = if prev >= 0.0 { params.alpha } else { params.beta };
-                                    reg_row[b] = prev * coef + inst_bucket[b];
+                                    reg_row[b] =
+                                        prev * coef + inst_bucket[b] * bucket_inv_norm[b];
                                 }
                             } else {
                                 for i in 0..n_hands {
@@ -2902,7 +3136,7 @@ impl PloGame {
 
                 #[cfg(not(target_arch = "wasm32"))]
                 let branch_cfvs: Vec<Vec<f32>> =
-                    map_chance_branches(rep_cards, rep_children, |card, child_id| {
+                    map_chance_branches(rep_cards, rep_children, |card, child_id, local_scratch| {
                         let cmask = card.mask();
                         let mut child_reach = vec![0.0f32; opp_cfreach.len()];
                         for (j, &r) in opp_cfreach.iter().enumerate() {
@@ -2910,12 +3144,11 @@ impl PloGame {
                                 child_reach[j] = r * inv_chance;
                             }
                         }
-                        let mut local_scratch = InclusionExclusionScratch::new();
                         let mut cfv = self.strategy_cfv_traverse(
                             child_id,
                             player,
                             &child_reach,
-                            &mut local_scratch,
+                            local_scratch,
                         );
                         for (i, c) in self.combos[player].iter().enumerate() {
                             if c.mask.intersects(cmask) {
@@ -3081,7 +3314,7 @@ impl PloGame {
 
                 #[cfg(not(target_arch = "wasm32"))]
                 let branch_cfvs: Vec<Vec<f64>> =
-                    map_chance_branches(rep_cards, rep_children, |card, child_id| {
+                    map_chance_branches(rep_cards, rep_children, |card, child_id, local_scratch| {
                         let cmask = card.mask();
                         let mut child_reach = vec![0.0f64; opp_cfreach.len()];
                         for (j, &r) in opp_cfreach.iter().enumerate() {
@@ -3089,12 +3322,11 @@ impl PloGame {
                                 child_reach[j] = r * inv_chance;
                             }
                         }
-                        let mut local_scratch = InclusionExclusionScratch::new();
                         let mut cfv = self.strategy_cfv_traverse_f64(
                             child_id,
                             player,
                             &child_reach,
-                            &mut local_scratch,
+                            local_scratch,
                         );
                         for (i, c) in self.combos[player].iter().enumerate() {
                             if c.mask.intersects(cmask) {
@@ -3265,7 +3497,7 @@ impl PloGame {
 
                 #[cfg(not(target_arch = "wasm32"))]
                 let branch_cfvs: Vec<Vec<f32>> =
-                    map_chance_branches(rep_cards, rep_children, |card, child_id| {
+                    map_chance_branches(rep_cards, rep_children, |card, child_id, local_scratch| {
                         let cmask = card.mask();
                         let mut child_reach = vec![0.0f32; opp_cfreach.len()];
                         for (j, &r) in opp_cfreach.iter().enumerate() {
@@ -3273,12 +3505,11 @@ impl PloGame {
                                 child_reach[j] = r * inv_chance;
                             }
                         }
-                        let mut local_scratch = InclusionExclusionScratch::new();
                         let mut cfv = self.best_response_traverse(
                             child_id,
                             player,
                             &child_reach,
-                            &mut local_scratch,
+                            local_scratch,
                         );
                         for (i, c) in self.combos[player].iter().enumerate() {
                             if c.mask.intersects(cmask) {
@@ -3827,6 +4058,7 @@ struct ConcreteBuilder<'a> {
     combo_ids: &'a [Vec<ComboId>; 2],
     oop_iso_vec: Vec<(ComboId, f32)>,
     ip_iso_vec: Vec<(ComboId, f32)>,
+    iso_cache: std::collections::HashMap<u64, ChanceIsomorphism>,
     action_tree: &'a ActionTree,
     abstraction: &'a dyn HandAbstraction,
     enable_iso: bool,
@@ -3939,7 +4171,10 @@ impl<'a> ConcreteBuilder<'a> {
                 }
             }
             ActionNodeKind::TerminalShowdown => {
-                debug_assert_eq!(committed[0], committed[1]);
+                assert_eq!(
+                    committed[0], committed[1],
+                    "TerminalShowdown requires equal player commitments"
+                );
                 let river_eval_id = self.get_or_build_river_eval(&board);
                 let half_pot_swing = half_start + (committed[0] as f64);
                 let rake_chips = if self.rake_fraction > 0.0 {
@@ -3968,11 +4203,18 @@ impl<'a> ConcreteBuilder<'a> {
                     .saturating_sub(HOLE_CARDS_BOTH_PLAYERS);
                 debug_assert!(chance_denominator == 41 || chance_denominator == 40);
                 if self.enable_iso {
-                    let iso = compute_chance_isomorphism(
-                        &board,
-                        &self.oop_iso_vec,
-                        &self.ip_iso_vec,
-                    );
+                    let bkey = board.mask().bits();
+                    let iso = if let Some(cached) = self.iso_cache.get(&bkey) {
+                        cached.clone()
+                    } else {
+                        let computed = compute_chance_isomorphism(
+                            &board,
+                            &self.oop_iso_vec,
+                            &self.ip_iso_vec,
+                        );
+                        self.iso_cache.insert(bkey, computed.clone());
+                        computed
+                    };
                     let mut rep_children = Vec::with_capacity(iso.representative_cards.len());
                     for &rcard in &iso.representative_cards {
                         let next_board = board.deal(rcard).expect("chance card cannot overlap board");
@@ -4054,6 +4296,7 @@ impl<'a> ConcreteBuilder<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn estimate_tree_memory(
     root_board: &Board,
     combos: &[Vec<WeightedHand>; 2],
@@ -4061,21 +4304,24 @@ fn estimate_tree_memory(
     action_tree: &ActionTree,
     abstraction: &dyn HandAbstraction,
     enable_iso: bool,
+    oop_iso: &[(ComboId, f32)],
+    ip_iso: &[(ComboId, f32)],
+    iso_cache: &mut std::collections::HashMap<u64, ChanceIsomorphism>,
 ) -> MemoryReport {
-    // Exact representative runout counts per street (`turn_mult` on Turn, `total_river_branches` on River)
-    let oop_iso: Vec<(ComboId, f32)> = combos[0].iter().map(|c| (c.combo_id, c.weight)).collect();
-    let ip_iso: Vec<(ComboId, f32)> = combos[1].iter().map(|c| (c.combo_id, c.weight)).collect();
-
+    // Exact representative runout counts per street (`turn_mult` on Turn, `total_river_branches` on River),
+    // caching `ChanceIsomorphism` by `board.mask().bits()` so `ConcreteBuilder` reuses it with zero duplicate work!
     let mut unique_river_boards: std::collections::HashSet<[u8; 5]> =
         std::collections::HashSet::new();
     let (turn_mult, total_river_branches): (usize, usize) = match root_board.street() {
         Street::Flop => {
             if enable_iso {
-                let flop_iso = compute_chance_isomorphism(root_board, &oop_iso, &ip_iso);
+                let flop_iso = compute_chance_isomorphism(root_board, oop_iso, ip_iso);
+                let rep_turns = flop_iso.representative_cards.clone();
+                iso_cache.insert(root_board.mask().bits(), flop_iso);
                 let mut sum_rivers = 0usize;
-                for &tc in &flop_iso.representative_cards {
+                for &tc in &rep_turns {
                     let tb = root_board.deal(tc).unwrap();
-                    let turn_iso = compute_chance_isomorphism(&tb, &oop_iso, &ip_iso);
+                    let turn_iso = compute_chance_isomorphism(&tb, oop_iso, ip_iso);
                     sum_rivers += turn_iso.representative_cards.len();
                     for &rc in &turn_iso.representative_cards {
                         let rb = tb.deal(rc).unwrap().river_cards().unwrap();
@@ -4083,17 +4329,18 @@ fn estimate_tree_memory(
                         key.sort_unstable();
                         unique_river_boards.insert(key);
                     }
+                    iso_cache.insert(tb.mask().bits(), turn_iso);
                 }
-                (flop_iso.representative_cards.len(), sum_rivers)
+                (rep_turns.len(), sum_rivers)
             } else {
                 (49, 49 * 48)
             }
         }
         Street::Turn => {
             if enable_iso {
-                let r_len = compute_chance_isomorphism(root_board, &oop_iso, &ip_iso)
-                    .representative_cards
-                    .len();
+                let t_iso = compute_chance_isomorphism(root_board, oop_iso, ip_iso);
+                let r_len = t_iso.representative_cards.len();
+                iso_cache.insert(root_board.mask().bits(), t_iso);
                 (1, r_len)
             } else {
                 (1, 48)
@@ -4239,7 +4486,8 @@ fn estimate_tree_memory(
     };
     let river_eval_bytes =
         (river_tables as u64) * ((combos[0].len() + combos[1].len()) as u64) * 12;
-    let node_overhead = ((dec_nodes + chance_nodes + term_nodes) as u64) * 96;
+    // Realistic concrete-node overhead (`size_of::<ConcreteNode>()` ~ 160 B + Vec action/children headers ~ 192 B)
+    let node_overhead = ((dec_nodes + chance_nodes + term_nodes) as u64) * 192;
 
     MemoryReport {
         decision_nodes: dec_nodes,
@@ -4354,11 +4602,30 @@ pub fn estimate_memory_for_config(
     if live_oop.is_empty() || live_ip.is_empty() {
         return Err(SolverError::Range(RangeError::EmptyRange));
     }
-    let combos = [live_oop.entries().to_vec(), live_ip.entries().to_vec()];
+    let combos = [
+        live_oop
+            .entries()
+            .iter()
+            .copied()
+            .filter(|c| c.weight > 0.0)
+            .collect::<Vec<_>>(),
+        live_ip
+            .entries()
+            .iter()
+            .copied()
+            .filter(|c| c.weight > 0.0)
+            .collect::<Vec<_>>(),
+    ];
+    if combos[0].is_empty() || combos[1].is_empty() {
+        return Err(SolverError::Range(RangeError::EmptyRange));
+    }
     let combo_ids = [
         combos[0].iter().map(|c| c.combo_id).collect::<Vec<_>>(),
         combos[1].iter().map(|c| c.combo_id).collect::<Vec<_>>(),
     ];
+    let oop_iso_vec: Vec<(ComboId, f32)> = combos[0].iter().map(|c| (c.combo_id, c.weight)).collect();
+    let ip_iso_vec: Vec<(ComboId, f32)> = combos[1].iter().map(|c| (c.combo_id, c.weight)).collect();
+    let mut iso_cache = std::collections::HashMap::new();
     let effective_iso = enable_chance_isomorphism && abstraction.is_suit_symmetric();
     Ok(estimate_tree_memory(
         &board,
@@ -4367,6 +4634,9 @@ pub fn estimate_memory_for_config(
         action_tree,
         abstraction,
         effective_iso,
+        &oop_iso_vec,
+        &ip_iso_vec,
+        &mut iso_cache,
     ))
 }
 
@@ -5611,7 +5881,7 @@ mod tests {
             PloRange::from_hands(v).unwrap()
         };
 
-        // Row 1: River 20 vs 20, 2 bet sizes (`8` decision nodes, `3,200` regret+strat bytes, `5,696` total bytes)
+        // Row 1: River 20 vs 20, 2 bet sizes (`8` decision nodes, `3,200` regret+strat bytes, `7,712` total bytes)
         let r_board: Board = "Ks9d4c7h2s".parse().unwrap();
         let r_tree = ActionTree::build(TreeConfig {
             initial_street: Street::River,
@@ -5625,16 +5895,16 @@ mod tests {
         let m_r20 = estimate_memory_for_config(r_board, &r20, &r20, &r_tree, &IdentityAbstraction, false).unwrap();
         assert_eq!(m_r20.decision_nodes, 8);
         assert_eq!(m_r20.regret_and_strategy_bytes, 3_200);
-        assert_eq!(m_r20.total_estimated_bytes, 5_696);
+        assert_eq!(m_r20.total_estimated_bytes, 7_712);
 
-        // Row 2: River 200 vs 200, 2 bet sizes (`8` decision nodes, `32,000` regret+strat bytes, `38,816` total bytes)
+        // Row 2: River 200 vs 200, 2 bet sizes (`8` decision nodes, `32,000` regret+strat bytes, `40,832` total bytes)
         let r200 = first_k_range(r_board, 200);
         let m_r200 = estimate_memory_for_config(r_board, &r200, &r200, &r_tree, &IdentityAbstraction, false).unwrap();
         assert_eq!(m_r200.decision_nodes, 8);
         assert_eq!(m_r200.regret_and_strategy_bytes, 32_000);
-        assert_eq!(m_r200.total_estimated_bytes, 38_816);
+        assert_eq!(m_r200.total_estimated_bytes, 40_832);
 
-        // Row 3: Turn 50 vs 50, 2 bet sizes, lossless (`776` decision nodes, `699,200` regret+strat bytes, `956,960` total bytes)
+        // Row 3: Turn 50 vs 50, 2 bet sizes, lossless (`776` decision nodes, `699,200` regret+strat bytes, `1,157,120` total bytes)
         let t_board: Board = "Ks9d4c7h".parse().unwrap();
         let t_tree = ActionTree::build(TreeConfig {
             initial_street: Street::Turn,
@@ -5649,9 +5919,9 @@ mod tests {
         let m_t50 = estimate_memory_for_config(t_board, &t50, &t50, &t_tree, &IdentityAbstraction, false).unwrap();
         assert_eq!(m_t50.decision_nodes, 776);
         assert_eq!(m_t50.regret_and_strategy_bytes, 699_200);
-        assert_eq!(m_t50.total_estimated_bytes, 956_960);
+        assert_eq!(m_t50.total_estimated_bytes, 1_157_120);
 
-        // Row 4: Flop 500 vs 500, 2 bet sizes, IdentityAbstraction (`57,240` decision nodes, `496,352,000` regret+strat, `526,247,936` total bytes > `512 MB` default cap!)
+        // Row 4: Flop 500 vs 500, 2 bet sizes, IdentityAbstraction (`57,240` decision nodes, `496,352,000` regret+strat, `542,031,872` total bytes > `512 MB` default cap!)
         let f_board: Board = "Ks9d4c".parse().unwrap();
         let f_tree = ActionTree::build(TreeConfig {
             initial_street: Street::Flop,
@@ -5667,9 +5937,9 @@ mod tests {
         let m_f500_id = estimate_memory_for_config(f_board, &f500, &f500, &f_tree, &IdentityAbstraction, false).unwrap();
         assert_eq!(m_f500_id.decision_nodes, 57_240);
         assert_eq!(m_f500_id.regret_and_strategy_bytes, 496_352_000);
-        assert_eq!(m_f500_id.total_estimated_bytes, 526_247_936);
+        assert_eq!(m_f500_id.total_estimated_bytes, 542_031_872);
 
-        // Verify `max_memory_bytes` guardrail (`500,000,000` bytes < `526,247,936` bytes, or `600 vs 600` under default `512 MB`)
+        // Verify `max_memory_bytes` guardrail (`500,000,000` bytes < `542,031,872` bytes, or `600 vs 600` under default `512 MB`)
         // cleanly refuses oversized Flop `IdentityAbstraction` without panicking!
         let f600 = first_k_range(f_board, 600);
         let refused = PloGame::with_options(
@@ -5688,11 +5958,11 @@ mod tests {
 
         // Row 5: Flop 50 buckets (`EquityBucketAbstraction(50, 50, 50)`) over `500 vs 500` combos (`iso = false`):
         // Cuts `regret_and_strategy_bytes` EXACTLY 10x (`49,635,200` bytes = `47.34 MiB`), plus `1 + 49 + 1,176 = 1,226`
-        // deduplicated `(board, player)` `Arc<[u32]>` bucket maps (`4,904,000` bytes) -> `84,435,136` total (`80.52 MiB` < `512 MiB` cap)!
+        // deduplicated `(board, player)` `Arc<[u32]>` bucket maps (`4,904,000` bytes) -> `100,219,072` total (`95.58 MiB` < `512 MiB` cap)!
         let abs50 = EquityBucketAbstraction::new(50, 50, 50);
         let m_f500_b50 = estimate_memory_for_config(f_board, &f500, &f500, &f_tree, &abs50, false).unwrap();
         assert_eq!(m_f500_b50.regret_and_strategy_bytes, 49_635_200);
-        assert_eq!(m_f500_b50.total_estimated_bytes, 84_435_136);
+        assert_eq!(m_f500_b50.total_estimated_bytes, 100_219_072);
         assert!(m_f500_b50.total_estimated_bytes < DEFAULT_MAX_MEMORY_BYTES);
 
         // Step 3: Explicit Iso OFF (`iso = false`) vs Iso ON (`iso = true`) Memory Table on Suit-Symmetric Ranges!
@@ -5785,7 +6055,7 @@ mod tests {
         assert_eq!(m_f50_noiso.river_eval_tables, 1_176);
         assert_eq!(m_f50_noiso.regret_and_strategy_bytes, 49_635_200);
         assert_eq!(m_f50_noiso.river_eval_bytes, 1_411_200);
-        assert_eq!(m_f50_noiso.total_estimated_bytes, 66_830_336);
+        assert_eq!(m_f50_noiso.total_estimated_bytes, 82_614_272);
 
         let m_f50_iso =
             estimate_memory_for_config(f_twotone, &sym50, &sym50, &f_tree, &IdentityAbstraction, true)
@@ -5796,7 +6066,7 @@ mod tests {
         assert_eq!(m_f50_iso.river_eval_tables, 799);
         assert_eq!(m_f50_iso.regret_and_strategy_bytes, 30_249_600);
         assert_eq!(m_f50_iso.river_eval_bytes, 958_800);
-        assert_eq!(m_f50_iso.total_estimated_bytes, 40_824_720);
+        assert_eq!(m_f50_iso.total_estimated_bytes, 50_441_040);
 
         // Also build the ACTUAL `PloGame` for `Flop 50 vs 50` (`iso = true`) to prove `estimate_memory_for_config`
         // matches `game.memory_report()` node-for-node and byte-for-byte on decision/chance/terminal/table counts & regret/strategy bytes!
@@ -5828,7 +6098,7 @@ mod tests {
                 .unwrap();
         assert_eq!(m_f500_twotone_noiso.decision_nodes, 57_240);
         assert_eq!(m_f500_twotone_noiso.regret_and_strategy_bytes, 496_352_000);
-        assert_eq!(m_f500_twotone_noiso.total_estimated_bytes, 526_247_936);
+        assert_eq!(m_f500_twotone_noiso.total_estimated_bytes, 542_031_872);
 
         let m_f500_twotone_iso =
             estimate_memory_for_config(f_twotone, &sym500, &sym500, &f_tree, &IdentityAbstraction, true)
@@ -5839,7 +6109,7 @@ mod tests {
         assert_eq!(m_f500_twotone_iso.river_eval_tables, 799);
         assert_eq!(m_f500_twotone_iso.regret_and_strategy_bytes, 302_496_000);
         assert_eq!(m_f500_twotone_iso.river_eval_bytes, 9_588_000);
-        assert_eq!(m_f500_twotone_iso.total_estimated_bytes, 321_700_320);
+        assert_eq!(m_f500_twotone_iso.total_estimated_bytes, 331_316_640);
 
         // Also verify `max_memory_bytes` guard triggers cleanly under BOTH `iso = false` (`600 vs 600` > `512 MiB`)
         // AND `iso = true` (`900 vs 900` > `512 MiB` = `536,870,912 B`)!
@@ -7112,5 +7382,371 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn p0_bucketed_lossless_trajectory_matches_identity_and_filters_zero_weights() {
+        // P0 verification:
+        // 1. On a 2-street Turn -> River game with mixed fractional prior weights (0.25, 0.5, 0.75, 1.0),
+        //    `EquityBucketAbstraction(k >= N)` assigns 1 combo per bucket (`is_identity = false` code path).
+        //    Its DCFR iteration trajectory (regrets, average strategies, EVs, exploitability) MUST match
+        //    `IdentityAbstraction` (`is_identity = true` code path) across every iteration!
+        // 2. Appending `weight = 0.0` hands via `PloRange::set_weight(..., 0.0)` must produce identical
+        //    combo counts, memory estimates, and DCFR trajectories (build-time zero-weight filtering).
+        let board: Board = "Ks9s4d2h".parse().unwrap();
+        let oop = PloRange::from_hands(vec![
+            ("AsQsJsTs".parse().unwrap(), 1.0),
+            ("KhKdQhQd".parse().unwrap(), 0.75),
+            ("9h9c8h8c".parse().unwrap(), 0.50),
+            ("7s6s5c3c".parse().unwrap(), 0.25),
+            ("AcAdJcJd".parse().unwrap(), 0.60),
+            ("TcTd8d7d".parse().unwrap(), 0.40),
+        ])
+        .unwrap();
+        let ip = PloRange::from_hands(vec![
+            ("AhQhJhTh".parse().unwrap(), 0.90),
+            ("KcKsQcQd".parse().unwrap(), 0.80),
+            ("Ts8s7c6c".parse().unwrap(), 0.35),
+            ("6h6d5h5d".parse().unwrap(), 0.50),
+            ("AdAsTdTc".parse().unwrap(), 1.0),
+            ("QdJdTd9c".parse().unwrap(), 0.45),
+        ])
+        .unwrap();
+
+        let mut oop_with_zeros = oop.clone();
+        oop_with_zeros.set_weight("2c3d5h6c".parse::<Hand4>().unwrap(), 0.0);
+        let mut ip_with_zeros = ip.clone();
+        ip_with_zeros.set_weight("2d3h5s6d".parse::<Hand4>().unwrap(), 0.0);
+
+        let tree = ActionTree::build(TreeConfig {
+            initial_street: Street::Turn,
+            starting_pot: 100,
+            effective_stack: 100,
+            turn_sizes: [
+                StreetBetSizes {
+                    bet_fractions: vec![0.5, 1.0],
+                    raise_fractions: vec![1.0],
+                    donk_fractions: None,
+                },
+                StreetBetSizes {
+                    bet_fractions: vec![0.75],
+                    raise_fractions: vec![1.0],
+                    donk_fractions: None,
+                },
+            ],
+            river_sizes: [
+                StreetBetSizes {
+                    bet_fractions: vec![0.75],
+                    raise_fractions: vec![1.0],
+                    donk_fractions: None,
+                },
+                StreetBetSizes {
+                    bet_fractions: vec![0.75],
+                    raise_fractions: vec![1.0],
+                    donk_fractions: None,
+                },
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let lossless_buckets = EquityBucketAbstraction::new(64, 64, 64);
+        let opts = SolverBuildOptions {
+            enable_chance_isomorphism: false,
+            ..Default::default()
+        };
+
+        let mut g_id =
+            PloGame::with_options(board, &oop, &ip, &tree, &IdentityAbstraction, opts.clone()).unwrap();
+        let mut g_bk =
+            PloGame::with_options(board, &oop, &ip, &tree, &lossless_buckets, opts.clone()).unwrap();
+        let mut g_zw = PloGame::with_options(
+            board,
+            &oop_with_zeros,
+            &ip_with_zeros,
+            &tree,
+            &lossless_buckets,
+            opts,
+        )
+        .unwrap();
+
+        assert_eq!(g_id.combos(0).len(), g_zw.combos(0).len());
+        assert_eq!(g_id.combos(1).len(), g_zw.combos(1).len());
+        let m_clean = estimate_memory_for_config(board, &oop, &ip, &tree, &IdentityAbstraction, false).unwrap();
+        let m_zeros = estimate_memory_for_config(
+            board,
+            &oop_with_zeros,
+            &ip_with_zeros,
+            &tree,
+            &IdentityAbstraction,
+            false,
+        )
+        .unwrap();
+        assert_eq!(m_clean.total_estimated_bytes, m_zeros.total_estimated_bytes);
+
+        for checkpoint in [1u32, 5, 25, 100] {
+            let cur = g_id.iterations_run();
+            let delta = checkpoint - cur;
+            for _ in 0..delta {
+                g_id.solve_step();
+                g_bk.solve_step();
+                g_zw.solve_step();
+            }
+
+            let exp_id = g_id.exploitability();
+            let exp_bk = g_bk.exploitability();
+            let exp_zw = g_zw.exploitability();
+            assert!(
+                (exp_id - exp_bk).abs() < 1e-5,
+                "iter {checkpoint}: Identity exploitability {exp_id} != lossless Bucketed {exp_bk}"
+            );
+            assert!(
+                (exp_id - exp_zw).abs() < 1e-6,
+                "iter {checkpoint}: zero-weight range perturbed exploitability ({exp_id} vs {exp_zw})"
+            );
+
+            let rep_id = g_id.inspect_current_node();
+            let rep_bk = g_bk.inspect_current_node();
+            for (i, (&s_id, &s_bk)) in rep_id.strategy.iter().zip(rep_bk.strategy.iter()).enumerate() {
+                assert!(
+                    (s_id - s_bk).abs() < 1e-5,
+                    "iter {checkpoint} root strategy[{i}] mismatch: Identity={s_id} vs Bucketed={s_bk}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn p0_two_street_turn_to_river_polar_vs_bluffcatcher_converges_to_exact_nash() {
+        // Multi-street (Turn -> 44-card Chance -> River) analytical Nash verification:
+        // Board on Turn: `Ks 9d 4c 2h`.
+        // - OOP holds pure Polarized range:
+        //   * Nut Top Set `Kh Kd Qh Jd` (unbeatable on every non-Ace? Wait: if Ace hits river, could IP make higher?
+        //     Let's give OOP `As Ad Ks Kd` — Aces full / Top Set, wait `Ks` is on board so `Ah Ad Kh Kd` = Kings full / Top Set,
+        //     and IP holds Medium Pair `9h 9s?` no `9d` on board -> `9h 8h 7d 6c`? No, give IP `Qc Qd Jc Td`!
+        //     Wait: on Q/J/T/A rivers, `QcQdJcTd` can make QJJ/straight! Let's pick cards with ZERO river outdraws!):
+        //   Board: `As Ks Qs 2d` (Turn, 3 spades on board!).
+        //   - OOP Nuts: `Js Ts 8c 7c` -> Royal/Spade Flush (`As Ks Qs Js Ts` = Royal Flush on Turn! 100% unbeatable on ALL 44 rivers!).
+        //   - OOP Air:  `3h 4h 6c 7d` -> Complete air (best 2+3 on any river is at most One Pair of 3/4/6/7 or Ace-high; cannot make straight or flush!).
+        //   - IP Bluffcatcher: `Ad Ah Kc Kd` -> Top Two Pair / Aces Full (`Ad Ah` + `As Ks Qs` = Trip Aces `AAA K Q` on Turn, or Full House on A/K/Q/2 river;
+        //     ALWAYS beats OOP Air `3h 4h 6c 7d` on all 44 rivers, and ALWAYS loses to OOP Royal Flush `Js Ts 8c 7c` on all 44 rivers!).
+        //   Notice too: OOP's two hands (`JsTs8c7c` and `3h4h6c7c`? Make disjoint: `JsTs8c9c` and `3h4h6d7d`) share ZERO cards with IP's `AdAhKcKd`
+        //   and ZERO cards with the board `AsKsQs2d`! So all 41 remaining deck cards deal cleanly with uniform probability and zero card-removal asymmetry!
+        //
+        // Game tree: Starting Pot = 100, Effective Stack = 100.
+        // Turn: OOP Check only (`turn_sizes[0] = []`), IP Check only (`turn_sizes[1] = []`) -> deals all 44 River runouts ->
+        // River: OOP can Check or Bet Pot (100, all-in), IP faces Check or Call/Fold!
+        // Wait: let's allow betting on BOTH Turn AND River (`turn_sizes = [Pot], [Pot]`, `river_sizes = [Pot], [Pot]`)!
+        // With Pot = 100 and Stack = 100, a Pot bet (100) is ALL-IN!
+        // Analytical Nash game value across Turn + 44 Rivers:
+        // - Regardless of whether OOP shoves Turn or checks to River and shoves River (or mixes across Turn/River),
+        //   OOP has 50% Royal Flush (`JsTs9c8c`, always wins) and 50% pure Air (`3h4h6d7d`, always loses when called).
+        // - Facing a pot-sized shove (risking 100 to win 200 -> pot odds 1:2), IP is indifferent when OOP bluffs half as often as value
+        //   (`alpha = B / (P + B) = 100 / 200 = 1/2` -> with 1 value combo and 1 bluff combo, OOP bluffs `3h4h6d7d` with total probability `1/2`
+        //   across the game tree, and IP calls `AdAhKcKd` such that OOP's bluff EV = 0!).
+        // - Exact Nash EV for OOP:
+        //   * Royal Flush wins the full 100 pot whenever IP checks back + half the time IP calls a 100 shove = `100 + 0.5 * 100 = +150` chips (from 0 baseline:
+        //     in zero-sum chip gain relative to start of Turn where pot=100: Checkdown gives +100 to Royal, 0 to Air -> baseline EV = +50;
+        //     with optimal bluffing +50% of pot on Royal = `0.5 * (100 + 50) + 0.5 * 0 = +75.0` chips!).
+        //   Let's verify: at start of Turn, pot = 100 (50 each? No, `plo_cfr` terminal EV is net chips won from start of postflop + pot share:
+        //   specifically, checkdown wins `+50.0` for winner and `-50.0` for loser! Wait: let's check `river_plo_polar_vs_bluffcatcher_nash_equilibrium` convention!).
+        let board: Board = "AsKsQs2d".parse().unwrap();
+        // Choose completely disjoint cards where Air NEVER outdraws Bluffcatcher on ANY of the 40 live rivers:
+        // - Royal Flush: `JsTs9c8c` (always Royal Flush `AsKsQsJsTs` on all 40 live rivers)
+        // - Pure Air:    `8h6h4c3c` (cannot make straight, flush, or two pair on ANY river:
+        //     * Spades: 0 spades in hand -> no flush
+        //     * Straights: 3 non-Ace board cards are `K(11), Q(10), 2(0)` -> any river card gives at most TWO ranks in `{2..9}`,
+        //       so 3 board cards can NEVER form a 5-card straight with `{8,6,4,3}` (even on `5` river, `{A,2,5}` + `{3,4}` is Wheel, wait: `A,2,5` IS on board if `5` hits!).
+        //       Good catch! `As` + `2d` + river `5x` + hole `4c3c` = `5-4-3-2-A` Wheel Straight!
+        //       Replace `4c3c` with `9h7h6c4c`! Let's check `9h7h6c4c` on `AsKsQs2d`:
+        //       - Broadway `{T,J,Q,K,A}`: hand has NO `{T,J,Q,K,A}` -> max 3 broadway cards from board -> no broadway straight!
+        //       - Non-broadway straight (`5-high`..`K-high`): requires >= 3 board cards in a 5-rank window <= K (`9..K` needs `{9,T,J,Q,K}`, board has `K,Q`, river adds at most 1 of `{T,J}` -> need 2 from hand, hand only has `9` -> max 4 cards!).
+        //       - Lower windows (`<= Q`, i.e. `8..Q` down to `A..5`): board `AsKsQs2d` has at most TWO cards in any window (`Q` alone, or `A,2` in wheel `A..5`), plus 1 river card = max 3 board cards (`A,2,5` or `A,2,3` or `A,2,4`); hand `9h7h6c4c` has ONLY `4` in `{A,2,3,4,5}`, so `4` + 1 other card cannot complete `A-2-3-4-5`!
+        //       - Pairs/Trips: hand `9,7,6,4` is unpaired and disjoint from `{A,K,Q,2}` -> on `9/7/6/4` river makes One Pair (`99AKQ`); on paired board river makes Two Pair (`AAKK9`), NEVER beats `AdAhKcKd` (Set of Aces `AAAKQ` / Full House `AAAKK`)!
+        //     Therefore `9h7h6c4c` has ZERO equity (0/40 rivers!) against `AdAhKcKd`!)
+        let oop: PloRange = "JsTs9c8c, 9h7h6c4c".parse().unwrap();
+        let ip: PloRange = "AdAhKcKd".parse().unwrap();
+
+        let no_bet = StreetBetSizes {
+            bet_fractions: vec![],
+            raise_fractions: vec![],
+            donk_fractions: None,
+        };
+        let pot_size = StreetBetSizes {
+            bet_fractions: vec![1.0],
+            raise_fractions: vec![1.0],
+            donk_fractions: None,
+        };
+        // Notice `JsTs9c8c` and `9h7h6c4c` share ZERO cards with `AdAhKcKd` or `AsKsQs2d`, so all 40 live rivers
+        // have exact uniform probability `1/40`!
+        // Look at `Ts`? Wait: `JsTs9c8c` holds `Js, Ts`; what if the river is `9s` (`As Ks Qs 2d 9s`)?
+        // Board has 4 spades (`As Ks Qs 9s`), and `AdAhKcKd` has NO spades (`Ad, Ah, Kc, Kd`)! Still loses to `JsTs`!
+        // What if the river is `Td` or `Jd` or `8s`? Wait: what if the river is `Ts`? `Ts` is in `JsTs9c8c`!
+        // Wait why was EV exactly `72.50` (`29/40 = 0.725`, i.e. 1 river out of 40 differed by `-100`?! `75 - 2.5 = 72.5`!!)?
+        // Aha!! `2.5 = 100 / 40`!! ONE river out of 40 blocked `JsTs9c8c` vs `9h7h6c4c`!!
+        // Look at the 40 cards not in `AsKsQs2d` (4) and `AdAhKcKd` (4): `52 - 8 = 44` cards!
+        // On the 4 rivers `{Js, Ts, 9c, 8c}`, `JsTs9c8c` IS BLOCKED (so OOP ONLY has Air `9h7h6c4c`, IP calls 100%, OOP EV = 0)!
+        // On the 4 rivers `{9h, 7h, 6c, 4c}`, `9h7h6c4c` IS BLOCKED (so OOP ONLY has Royal `JsTs9c8c`, IP folds 100%, OOP EV = 100)!
+        // On the remaining `44 - 8 = 36` rivers, BOTH OOP combos are unblocked (polar vs bluffcatcher -> OOP EV = `0.5 * 150 + 0.5 * 0 = 75`)!
+        // Let's compute the EXACT card-removal analytical Nash EV across all 40 valid `(oop, ip, river)` triples (`2 * 40 = 80` triples):
+        // - `36` unblocked rivers (`72` triples): Royal wins `150`, Air wins `0` -> sum = `36 * 150 = 5,400`
+        // - `4` Air-blocked rivers `{9h, 7h, 6c, 4c}` (`4` Royal triples): IP knows OOP cannot have Air (`9h7h6c4c` is blocked by the river card!!),
+        //   so IP's exact Nash response on `{9h, 7h, 6c, 4c}` is FOLD 100%! Royal wins `100` (not `150`!) -> sum = `4 * 100 = 400`!
+        // - `4` Royal-blocked rivers `{Js, Ts, 9c, 8c}` (`4` Air triples): IP knows OOP cannot have Royal (`JsTs9c8c` is blocked by the river card!!),
+        //   so OOP checks Air (EV = `0`) -> sum = `4 * 0 = 0`!
+        // TOTAL EXACT ANALYTICAL NASH EV = `(5,400 + 400 + 0) / 80 = 5,800 / 80 = 72.500000` chips for OOP, and `27.500000` chips for IP!!
+        // And on the 2-street game where OOP can shove TURN *before* the river card reveals blockers, OOP shoves Turn to avoid river blocker revelation and gets `75.0`!!
+        let tree_check_turn = ActionTree::build(TreeConfig {
+            initial_street: Street::Turn,
+            starting_pot: 100,
+            effective_stack: 100,
+            active_betting_streets: [true, false, true],
+            turn_sizes: [no_bet.clone(), no_bet],
+            river_sizes: [pot_size.clone(), pot_size.clone()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut g_id = PloGame::new(board, &oop, &ip, &tree_check_turn).unwrap();
+        let exp_id = g_id.solve(600, 0.0);
+        assert!(
+            exp_id < 0.10,
+            "2-street Turn->River Identity exploitability did not converge: {exp_id}"
+        );
+        let [ev_oop, ev_ip] = g_id.root_expected_values();
+        assert!(
+            (ev_oop - 72.5).abs() < 0.15 && (ev_ip - 27.5).abs() < 0.15,
+            "expected exact card-removal analytical Nash EV [72.5, 27.5], got [{ev_oop}, {ev_ip}]"
+        );
+
+        let nb_abs = NutBlockerBucketAbstraction::new((4, 2), (4, 2), (4, 2));
+        let mut g_nb = PloGame::with_options(
+            board,
+            &oop,
+            &ip,
+            &tree_check_turn,
+            &nb_abs,
+            SolverBuildOptions::default(),
+        )
+        .unwrap();
+        let exp_nb = g_nb.solve(600, 0.0);
+        assert!(
+            exp_nb < 0.10,
+            "2-street Turn->River Bucketed exploitability did not converge: {exp_nb}"
+        );
+        let [ev_oop_nb, ev_ip_nb] = g_nb.root_expected_values();
+        assert!(
+            (ev_oop_nb - 72.5).abs() < 0.15 && (ev_ip_nb - 27.5).abs() < 0.15,
+            "expected exact card-removal analytical Bucketed Nash EV [72.5, 27.5], got [{ev_oop_nb}, {ev_ip_nb}]"
+        );
+
+        // Full 2-street active betting tree (Turn + River pot-sized bets/raises on BOTH streets):
+        // Because OOP can shove on the Turn *before* a `{9h,7h,6c,4c}` river card exposes that Air is blocked,
+        // OOP's exact 2-street Nash EV rises from `72.5` (forced Turn check) to `75.0` (Turn polar shove)!
+        let tree_two_street_bets = ActionTree::build(TreeConfig {
+            initial_street: Street::Turn,
+            starting_pot: 100,
+            effective_stack: 100,
+            turn_sizes: [pot_size.clone(), pot_size.clone()],
+            river_sizes: [pot_size.clone(), pot_size],
+            ..Default::default()
+        })
+        .unwrap();
+        let mut g_full_id = PloGame::new(board, &oop, &ip, &tree_two_street_bets).unwrap();
+        let exp_full_id = g_full_id.solve(600, 0.0);
+        let mut g_full_nb = PloGame::with_options(
+            board,
+            &oop,
+            &ip,
+            &tree_two_street_bets,
+            &nb_abs,
+            SolverBuildOptions::default(),
+        )
+        .unwrap();
+        let exp_full_nb = g_full_nb.solve(600, 0.0);
+        assert!(exp_full_id < 0.15 && exp_full_nb < 0.15);
+        let [f_oop_id, f_ip_id] = g_full_id.root_expected_values();
+        let [f_oop_nb, _f_ip_nb] = g_full_nb.root_expected_values();
+        assert!(
+            (f_oop_id - 75.0).abs() < 0.25 && (f_ip_id - 25.0).abs() < 0.25,
+            "expected full 2-street betting Nash EV [75.0, 25.0], got [{f_oop_id}, {f_ip_id}]"
+        );
+        assert!((f_oop_id - f_oop_nb).abs() < 0.05);
+    }
+
+    #[test]
+    fn f8_plosnap2_validates_config_hash_rejects_v1_and_nan_without_corrupting_game() {
+        let board: Board = "Ks9d4c7h2s".parse().unwrap();
+        let oop: PloRange = "AAKK$ds, QQJJ$ds".parse().unwrap();
+        let ip: PloRange = "KKQQ$ds, JJTT$ds".parse().unwrap();
+        let half_pot = StreetBetSizes {
+            bet_fractions: vec![0.5],
+            raise_fractions: vec![1.0],
+            donk_fractions: None,
+        };
+        let full_pot = StreetBetSizes {
+            bet_fractions: vec![1.0],
+            raise_fractions: vec![1.0],
+            donk_fractions: None,
+        };
+        let tree_a = ActionTree::build(TreeConfig {
+            initial_street: Street::River,
+            starting_pot: 100,
+            effective_stack: 100,
+            river_sizes: [half_pot.clone(), half_pot],
+            ..Default::default()
+        })
+        .unwrap();
+        // Same node count & bucket counts on River, but DIFFERENT bet size (1.0x pot instead of 0.5x pot)!
+        let tree_b = ActionTree::build(TreeConfig {
+            initial_street: Street::River,
+            starting_pot: 100,
+            effective_stack: 100,
+            river_sizes: [full_pot.clone(), full_pot],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut game_a = PloGame::new(board, &oop, &ip, &tree_a).unwrap();
+        game_a.solve(80, 0.0);
+        let snap_a = game_a.export_weights_binary();
+        assert_eq!(&snap_a[..8], b"PLOSNAP2");
+
+        // 1. Roundtrip into fresh game_a2 succeeds and preserves exact exploitability & strategy
+        let mut game_a2 = PloGame::new(board, &oop, &ip, &tree_a).unwrap();
+        game_a2.import_weights_binary(&snap_a).unwrap();
+        assert_eq!(game_a2.iterations_run(), 80);
+        assert!((game_a.exploitability() - game_a2.exploitability()).abs() < 1e-6);
+
+        // 2. Importing snap_a (0.5x pot) into game_b (1.0x pot, identical node/bucket dimensions!)
+        //    MUST be rejected by structural_config_hash!
+        let mut game_b = PloGame::new(board, &oop, &ip, &tree_b).unwrap();
+        game_b.solve(25, 0.0);
+        let exp_before = game_b.exploitability();
+        let err_hash = game_b.import_weights_binary(&snap_a).unwrap_err().to_string();
+        assert!(
+            err_hash.contains("configuration hash mismatch"),
+            "unexpected error: {err_hash}"
+        );
+        // Atomic staging check: game_b state is completely untouched!
+        assert_eq!(game_b.iterations_run(), 25);
+        assert!((game_b.exploitability() - exp_before).abs() < 1e-9);
+
+        // 3. Legacy PLOSNAP1 magic is rejected with an explicit human-readable upgrade message
+        let mut legacy = snap_a.clone();
+        legacy[..8].copy_from_slice(b"PLOSNAP1");
+        let err_v1 = game_a2.import_weights_binary(&legacy).unwrap_err().to_string();
+        assert!(err_v1.contains("PLOSNAP1") && err_v1.contains("PLOSNAP2"));
+
+        // 4. Corrupting the root Player node's first regret f32 to NaN is rejected without mutating game_a2
+        let mut nan_snap = snap_a.clone();
+        // Header: 8 (magic) + 8 (hash) + 4 (iters) + 4 (n_nodes) + 1 (node 0 Player marker) + 4 (len) = byte 29
+        nan_snap[29..33].copy_from_slice(&f32::NAN.to_le_bytes());
+        let err_nan = game_a2.import_weights_binary(&nan_snap).unwrap_err().to_string();
+        assert!(
+            err_nan.contains("non-finite") || err_nan.contains("negative"),
+            "unexpected NaN error: {err_nan}"
+        );
+        assert_eq!(game_a2.iterations_run(), 80);
     }
 }

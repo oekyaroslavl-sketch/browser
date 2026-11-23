@@ -24,17 +24,30 @@ fn run_sync_cmd(
     Ok(our_json_to_serde(&out))
 }
 
+async fn run_blocking_cmd(
+    state: State<'_, Arc<DesktopState>>,
+    cmd: &'static str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let shared = Arc::clone(&state);
+    let j_args = serde_to_our_json(&args);
+    let out = tauri::async_runtime::spawn_blocking(move || dispatch_command(&shared, cmd, &j_args))
+        .await
+        .map_err(|e| format!("task join error: {e}"))??;
+    Ok(our_json_to_serde(&out))
+}
+
 #[tauri::command]
 fn list_spots(state: State<'_, Arc<DesktopState>>) -> Result<serde_json::Value, String> {
     Ok(our_json_to_serde(&state.list_spots()))
 }
 
 #[tauri::command]
-fn set_pack_folder(
+async fn set_pack_folder(
     state: State<'_, Arc<DesktopState>>,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    run_sync_cmd(&state, "set_pack_folder", args)
+    run_blocking_cmd(state, "set_pack_folder", args).await
 }
 
 #[tauri::command]
@@ -102,27 +115,27 @@ fn parse_board(
 }
 
 #[tauri::command]
-fn compute_equity(
+async fn compute_equity(
     state: State<'_, Arc<DesktopState>>,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    run_sync_cmd(&state, "compute_equity", args)
+    run_blocking_cmd(state, "compute_equity", args).await
 }
 
 #[tauri::command]
-fn estimate_spot(
+async fn estimate_spot(
     state: State<'_, Arc<DesktopState>>,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    run_sync_cmd(&state, "estimate_spot", args)
+    run_blocking_cmd(state, "estimate_spot", args).await
 }
 
 #[tauri::command]
-fn build_game(
+async fn build_game(
     state: State<'_, Arc<DesktopState>>,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    run_sync_cmd(&state, "build_game", args)
+    run_blocking_cmd(state, "build_game", args).await
 }
 
 #[tauri::command]
@@ -135,18 +148,11 @@ async fn solve_spot(
     let cfg = SpotConfig::from_json(&j_args)?;
     let shared = Arc::clone(&state);
 
-    // Run DCFR on a dedicated OS worker thread so the UI thread stays 100% responsive
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let res = shared.solve_blocking(&cfg, 0, |ev| {
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        shared.solve_blocking(&cfg, 0, |ev| {
             let payload = our_json_to_serde(&ev.to_json());
             let _ = app.emit("solve-progress", payload);
-        });
-        let _ = tx.send(res);
-    });
-
-    let res = tauri::async_runtime::spawn_blocking(move || {
-        rx.recv().map_err(|_| "solver worker thread disconnected".to_string())?
+        })
     })
     .await
     .map_err(|e| format!("task join error: {e}"))??;
@@ -396,35 +402,35 @@ async fn compare_bet_simplifications(
 }
 
 #[tauri::command]
-fn save_tree_snapshot(
+async fn save_tree_snapshot(
     state: State<'_, Arc<DesktopState>>,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    run_sync_cmd(&state, "save_tree_snapshot", args)
+    run_blocking_cmd(state, "save_tree_snapshot", args).await
 }
 
 #[tauri::command]
-fn load_tree_snapshot(
+async fn load_tree_snapshot(
     state: State<'_, Arc<DesktopState>>,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    run_sync_cmd(&state, "load_tree_snapshot", args)
+    run_blocking_cmd(state, "load_tree_snapshot", args).await
 }
 
 #[tauri::command]
-fn export_config(
+async fn export_config(
     state: State<'_, Arc<DesktopState>>,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    run_sync_cmd(&state, "export_config", args)
+    run_blocking_cmd(state, "export_config", args).await
 }
 
 #[tauri::command]
-fn import_config(
+async fn import_config(
     state: State<'_, Arc<DesktopState>>,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    run_sync_cmd(&state, "import_config", args)
+    run_blocking_cmd(state, "import_config", args).await
 }
 
 fn main() {

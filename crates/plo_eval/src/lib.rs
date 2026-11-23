@@ -117,6 +117,10 @@ impl HandRank {
 
     #[inline]
     pub const fn category(self) -> HandCategory {
+        debug_assert!(
+            self.0 >= 1 && self.0 <= 7462,
+            "HandRank out of valid 1..=7462 range"
+        );
         match self.0 {
             1..=1277 => HandCategory::HighCard,
             1278..=4137 => HandCategory::OnePair,
@@ -299,10 +303,11 @@ pub fn slow_eval_plo_lex(hand: Hand4, board: &Board) -> Result<(u32, usize), Car
 // Fast Lookup Table Evaluator (O(1) 5-card kernel + specialized 2+3 PLO loops)
 // ============================================================================
 
-/// Open-addressed power-of-two hash table mapping paired/trips/quads 5-card prime products
-/// (`3,611` distinct products) to `HandRank(u16)` in `O(1)` (~1.15 average probes, 64 KB total).
+/// Open-addressed power-of-two hash table mapping paired/two-pair/trips/full-house/quads
+/// 5-card prime products (`4,888` distinct products in `8,192` slots, load factor `~0.60`,
+/// `64 KiB` total) to `HandRank(u16)` in `O(1)`.
 const HASH_BITS: u32 = 13;
-const HASH_SIZE: usize = 1 << HASH_BITS; // 8192 slots * 8 bytes = 64 KB
+const HASH_SIZE: usize = 1 << HASH_BITS; // 8192 slots * 8 bytes = 64 KiB
 const HASH_MASK: usize = HASH_SIZE - 1;
 const FIB_MULT: u32 = 2_654_435_769;
 
@@ -319,7 +324,7 @@ struct EvalTables {
     flush_lookup: [u16; 8192],
     /// Indexed by 13-bit rank mask (`0..8192`) for 5 distinct non-suited ranks (`HighCard` or `Straight`).
     unique5_lookup: [u16; 8192],
-    /// Open-addressed table for paired/two-pair/trips/full-house/quads prime products (`3,611` entries in `8,192` slots).
+    /// Open-addressed table for paired/two-pair/trips/full-house/quads prime products (`4,888` entries in `8,192` slots).
     prime_hash: [PrimeSlot; HASH_SIZE],
 }
 
@@ -482,14 +487,30 @@ fn lookup_prime(prime_hash: &[PrimeSlot; HASH_SIZE], prod: u32) -> u16 {
         if entry.product == prod {
             return entry.rank;
         }
-        debug_assert_ne!(entry.product, 0, "unrecognized 5-card prime product");
+        assert!(
+            entry.product != 0,
+            "unrecognized 5-card prime product (duplicate or invalid cards passed to evaluator)"
+        );
         slot = (slot + 1) & HASH_MASK;
     }
 }
 
 /// Evaluates a 5-card poker hand in `O(1)` with zero heap allocations.
+///
+/// # Panics
+/// Panics if `cards` contains duplicate cards (`count_ones() != 5`).
 #[inline]
 pub fn eval_5_cards(cards: [Card; 5]) -> HandRank {
+    let mask = cards[0].mask()
+        | cards[1].mask()
+        | cards[2].mask()
+        | cards[3].mask()
+        | cards[4].mask();
+    assert_eq!(
+        mask.len(),
+        5,
+        "eval_5_cards requires 5 distinct cards, got duplicates"
+    );
     let tbl = tables();
     eval_5_with_tables(tbl, cards)
 }
@@ -622,11 +643,17 @@ impl RiverBoardCache {
 }
 
 /// Specialized PLO flop evaluator: evaluates all `C(4,2) * C(3,3) = 6` legal 2+3 combinations.
+///
+/// # Panics
+/// Panics if `flop` contains duplicate cards or overlaps `hand` (use [`eval_plo`] for fallible `Result`).
 #[inline]
 pub fn eval_plo_flop(hand: Hand4, flop: [Card; 3]) -> HandRank {
-    debug_assert!(!hand.is_blocked_by(
-        flop[0].mask() | flop[1].mask() | flop[2].mask()
-    ));
+    let fmask = flop[0].mask() | flop[1].mask() | flop[2].mask();
+    assert_eq!(fmask.len(), 3, "eval_plo_flop: flop has duplicate cards");
+    assert!(
+        !hand.is_blocked_by(fmask),
+        "eval_plo_flop: hand overlaps flop board"
+    );
     let tbl = tables();
     let bt = triple_desc(flop[0], flop[1], flop[2]);
     let [c0, c1, c2, c3] = hand.cards();
@@ -650,11 +677,17 @@ pub fn eval_plo_flop(hand: Hand4, flop: [Card; 3]) -> HandRank {
 }
 
 /// Specialized PLO turn evaluator: evaluates all `C(4,2) * C(4,3) = 24` legal 2+3 combinations.
+///
+/// # Panics
+/// Panics if `turn` contains duplicate cards or overlaps `hand` (use [`eval_plo`] for fallible `Result`).
 #[inline]
 pub fn eval_plo_turn(hand: Hand4, turn: [Card; 4]) -> HandRank {
-    debug_assert!(!hand.is_blocked_by(
-        turn[0].mask() | turn[1].mask() | turn[2].mask() | turn[3].mask()
-    ));
+    let tmask = turn[0].mask() | turn[1].mask() | turn[2].mask() | turn[3].mask();
+    assert_eq!(tmask.len(), 4, "eval_plo_turn: turn has duplicate cards");
+    assert!(
+        !hand.is_blocked_by(tmask),
+        "eval_plo_turn: hand overlaps turn board"
+    );
     let tbl = tables();
     let triples = [
         triple_desc(turn[0], turn[1], turn[2]),
@@ -685,15 +718,18 @@ pub fn eval_plo_turn(hand: Hand4, turn: [Card; 4]) -> HandRank {
 }
 
 /// Specialized PLO river evaluator: evaluates all `C(4,2) * C(5,3) = 60` legal 2+3 combinations.
+///
+/// # Panics
+/// Panics if `river` contains duplicate cards or overlaps `hand` (use [`eval_plo`] for fallible `Result`).
 #[inline]
 pub fn eval_plo_river(hand: Hand4, river: [Card; 5]) -> HandRank {
-    debug_assert!(!hand.is_blocked_by(
-        river[0].mask()
-            | river[1].mask()
-            | river[2].mask()
-            | river[3].mask()
-            | river[4].mask()
-    ));
+    let rmask =
+        river[0].mask() | river[1].mask() | river[2].mask() | river[3].mask() | river[4].mask();
+    assert_eq!(rmask.len(), 5, "eval_plo_river: river has duplicate cards");
+    assert!(
+        !hand.is_blocked_by(rmask),
+        "eval_plo_river: hand overlaps river board"
+    );
     RiverBoardCache::new(river).eval_hand_unchecked(hand)
 }
 
@@ -1003,5 +1039,38 @@ mod tests {
             }
             prev = Some((lex, r));
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "eval_5_cards requires 5 distinct cards")]
+    fn eval_5_cards_rejects_duplicate_cards_in_release() {
+        let ace_spades: Card = "As".parse().unwrap();
+        let _ = eval_5_cards([ace_spades; 5]);
+    }
+
+    #[test]
+    #[should_panic(expected = "eval_plo_flop: hand overlaps flop board")]
+    fn eval_plo_flop_rejects_hand_board_overlap_in_release() {
+        let hand: Hand4 = "AsKsQhJh".parse().unwrap();
+        let flop = [
+            "As".parse().unwrap(),
+            "7d".parse().unwrap(),
+            "2c".parse().unwrap(),
+        ];
+        let _ = eval_plo_flop(hand, flop);
+    }
+
+    #[test]
+    #[should_panic(expected = "eval_plo_river: hand overlaps river board")]
+    fn eval_plo_river_rejects_hand_board_overlap_in_release() {
+        let hand: Hand4 = "AsKsQhJh".parse().unwrap();
+        let river = [
+            "Qh".parse().unwrap(),
+            "Td".parse().unwrap(),
+            "9c".parse().unwrap(),
+            "7d".parse().unwrap(),
+            "2c".parse().unwrap(),
+        ];
+        let _ = eval_plo_river(hand, river);
     }
 }
